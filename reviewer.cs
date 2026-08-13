@@ -21,10 +21,10 @@ static class ReviewerApp
             var apiKey = GetApiKey();
             var prompt = BuildReviewPrompt(skills, diff);
             var reviewJson = await RequestReviewJsonAsync(apiKey, prompt);
+            var review = ParseReviewResult(reviewJson);
 
-            Console.WriteLine("AI Code Review");
-            Console.WriteLine();
-            Console.WriteLine(reviewJson);
+            ValidateReviewResult(review);
+            PrintReview(review);
             return 0;
         }
         catch (ReviewFailureException ex)
@@ -258,8 +258,127 @@ static class ReviewerApp
 
         return "No error details returned.";
     }
+
+    private static ReviewResult ParseReviewResult(string reviewJson)
+    {
+        using var document = JsonDocument.Parse(reviewJson);
+        var root = document.RootElement;
+
+        if (!root.TryGetProperty("findings", out var findingsElement)
+            || findingsElement.ValueKind != JsonValueKind.Array)
+        {
+            throw new ReviewFailureException("Malformed model response: findings array is missing.");
+        }
+
+        var findings = new List<ReviewFinding>();
+        foreach (var findingElement in findingsElement.EnumerateArray())
+        {
+            if (findingElement.ValueKind != JsonValueKind.Object)
+            {
+                throw new ReviewFailureException("Malformed model response: finding must be an object.");
+            }
+
+            findings.Add(new ReviewFinding(
+                ReadRequiredString(findingElement, "file"),
+                ReadRequiredInt(findingElement, "line"),
+                ReadRequiredString(findingElement, "severity"),
+                ReadRequiredString(findingElement, "title"),
+                ReadRequiredString(findingElement, "message"),
+                ReadRequiredString(findingElement, "suggestion")));
+        }
+
+        return new ReviewResult(findings);
+    }
+
+    private static string ReadRequiredString(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var property) || property.ValueKind != JsonValueKind.String)
+        {
+            throw new ReviewFailureException($"Malformed model response: {propertyName} is missing or invalid.");
+        }
+
+        return property.GetString() ?? string.Empty;
+    }
+
+    private static int ReadRequiredInt(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var property) || property.ValueKind != JsonValueKind.Number)
+        {
+            throw new ReviewFailureException($"Malformed model response: {propertyName} is missing or invalid.");
+        }
+
+        return property.GetInt32();
+    }
+
+    private static void ValidateReviewResult(ReviewResult review)
+    {
+        if (review.Findings is null)
+        {
+            throw new ReviewFailureException("Invalid review result: findings is missing.");
+        }
+
+        for (var i = 0; i < review.Findings.Count; i++)
+        {
+            var finding = review.Findings[i];
+            if (string.IsNullOrWhiteSpace(finding.File))
+            {
+                throw new ReviewFailureException($"Invalid review finding {i + 1}: file is required.");
+            }
+
+            if (finding.Line < 1)
+            {
+                throw new ReviewFailureException($"Invalid review finding {i + 1}: line must be greater than zero.");
+            }
+
+            if (finding.Severity is not ("high" or "medium" or "low"))
+            {
+                throw new ReviewFailureException($"Invalid review finding {i + 1}: severity must be high, medium, or low.");
+            }
+
+            if (string.IsNullOrWhiteSpace(finding.Title)
+                || string.IsNullOrWhiteSpace(finding.Message)
+                || string.IsNullOrWhiteSpace(finding.Suggestion))
+            {
+                throw new ReviewFailureException($"Invalid review finding {i + 1}: title, message, and suggestion are required.");
+            }
+        }
+    }
+
+    private static void PrintReview(ReviewResult review)
+    {
+        Console.WriteLine("AI Code Review");
+        Console.WriteLine();
+
+        if (review.Findings.Count == 0)
+        {
+            Console.WriteLine("No significant issues found.");
+            return;
+        }
+
+        foreach (var finding in review.Findings)
+        {
+            Console.WriteLine($"[{finding.Severity.ToUpperInvariant()}] {finding.File}:{finding.Line}");
+            Console.WriteLine(finding.Title);
+            Console.WriteLine();
+            Console.WriteLine(finding.Message);
+            Console.WriteLine();
+            Console.WriteLine("Suggestion:");
+            Console.WriteLine(finding.Suggestion);
+            Console.WriteLine();
+        }
+    }
 }
 
 sealed class ReviewFailureException(string message) : Exception(message);
 
 record ReviewSkill(string Name, string Content);
+
+record ReviewResult(List<ReviewFinding> Findings);
+
+record ReviewFinding(
+    string File,
+    int Line,
+    string Severity,
+    string Title,
+    string Message,
+    string Suggestion);
