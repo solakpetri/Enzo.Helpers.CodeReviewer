@@ -145,7 +145,7 @@ static class ReviewerApp
 
         if (!response.IsSuccessStatusCode)
         {
-            throw new ReviewFailureException($"OpenAI request failed ({(int)response.StatusCode} {response.ReasonPhrase}): {GetOpenAiErrorMessage(responseBody)}");
+            throw new ReviewFailureException($"OpenAI request failed ({(int)response.StatusCode} {response.ReasonPhrase}): {GetOpenAiErrorMessage(responseBody, apiKey)}");
         }
 
         return ExtractResponseText(responseBody);
@@ -239,7 +239,7 @@ static class ReviewerApp
         throw new ReviewFailureException("Malformed model response: missing review text.");
     }
 
-    private static string GetOpenAiErrorMessage(string responseBody)
+    private static string GetOpenAiErrorMessage(string responseBody, string apiKey)
     {
         try
         {
@@ -248,7 +248,7 @@ static class ReviewerApp
                 && error.TryGetProperty("message", out var message)
                 && message.ValueKind == JsonValueKind.String)
             {
-                return message.GetString() ?? "No error details returned.";
+                return RedactSecret(message.GetString() ?? "No error details returned.", apiKey);
             }
         }
         catch (JsonException)
@@ -258,6 +258,9 @@ static class ReviewerApp
 
         return "No error details returned.";
     }
+
+    private static string RedactSecret(string value, string secret) =>
+        string.IsNullOrEmpty(secret) ? value : value.Replace(secret, "<redacted>", StringComparison.Ordinal);
 
     private static ReviewResult ParseReviewResult(string reviewJson)
     {
