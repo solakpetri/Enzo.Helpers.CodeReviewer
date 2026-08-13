@@ -28,6 +28,7 @@ jobs:
         with:
           repository: solakpetri/Enzo.Ai.Skills
           path: Enzo.Ai.Skills
+          token: ''
           persist-credentials: false
 
       - name: Set up .NET
