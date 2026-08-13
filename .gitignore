@@ -1,0 +1,23 @@
+bin/
+obj/
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Local credentials and secret stores
+.env
+.env.*
+secrets.json
+appsettings.json
+appsettings.*.json
+*.pfx
+*.p12
+*.pem
+*.key
+
+# Local run artifacts
+*.log
+*.tmp
+sample.diff
+changes.diff
