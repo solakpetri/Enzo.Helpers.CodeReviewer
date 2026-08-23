@@ -4,33 +4,27 @@
 
 `Enzo.Helpers.CodeReviewer` is a lightweight AI-assisted code reviewer implemented as a .NET 10 file-based C# application.
 
-It reviews unified diffs using external review skills and OpenAI, validates the structured model response, and prints findings to stdout. In GitHub Actions, stdout is visible in the workflow log.
+It reviews pull request diffs using external review skills and OpenAI, validates the structured model response, prints findings to stdout, and posts the findings as an advisory GitHub Pull Request Review.
 
 ## Architecture
 
 ```text
-GitHub Pull Request
+PR
         |
         v
 GitHub Actions
         |
         v
-PR diff
-        |
-        v
-Enzo.Helpers.CodeReviewer
-        |
-        v
-Enzo.Ai.Skills
+Code Reviewer
         |
         v
 OpenAI
         |
         v
-Review findings
+GitHub Pull Request Review
 ```
 
-The current version outputs findings to the GitHub Actions log. PR comments and inline review comments are not implemented yet.
+The GitHub review is always submitted with the `COMMENT` event. It does not approve PRs or request changes.
 
 ## Enzo.Ai.Skills
 
@@ -137,6 +131,7 @@ checks out source
 -> generates diff
 -> runs reviewer
 -> prints findings
+-> posts a COMMENT pull request review
 ```
 
 It uses GitHub-hosted `ubuntu-latest`, sets up .NET 10, checks out `Enzo.Ai.Skills` with `actions/checkout`, generates the PR diff in `$RUNNER_TEMP/changes.diff`, and runs:
@@ -146,6 +141,14 @@ dotnet reviewer.cs "$RUNNER_TEMP/changes.diff" --skills ../Enzo.Ai.Skills
 ```
 
 The diff is generated from the pull request base SHA to the pull request head SHA, so the reviewer receives only PR changes. The generated diff file is temporary and is not committed.
+
+The reusable workflow grants only the permissions needed to read repository contents and write pull request reviews:
+
+```yaml
+permissions:
+  contents: read
+  pull-requests: write
+```
 
 ## GitHub Secret
 
@@ -163,6 +166,14 @@ OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
 Do not commit the key or place it in repository files.
 
+The workflow also passes the automatically provided GitHub Actions token to the reviewer:
+
+```yaml
+GITHUB_TOKEN: ${{ github.token }}
+```
+
+Consuming repositories do not need to configure a separate `GITHUB_TOKEN` secret.
+
 ## Current Limitations
 
 The current version:
@@ -171,16 +182,16 @@ The current version:
 - loads external skills
 - runs automatically through GitHub Actions
 - prints findings to workflow logs
+- posts a GitHub Pull Request Review using `COMMENT`
+- never approves PRs or requests changes
 
-It does not yet:
+Current limitations:
 
-- post PR comments
 - create inline review comments
-- approve PRs
-- request changes
+- a new AI review may be created every time the PR is synchronized
 
 ## Roadmap
 
-Next milestone: GitHub Pull Request review publishing.
+Duplicate-review handling is planned for a later version.
 
 Later milestone: inline review comments.
