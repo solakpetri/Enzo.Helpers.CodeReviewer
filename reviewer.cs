@@ -15,9 +15,10 @@ static class ReviewerApp
     {
         try
         {
-            var diffPath = GetDiffPath(args);
+            var options = GetOptions(args);
+            var diffPath = GetDiffPath(options.DiffPath);
             var diff = await File.ReadAllTextAsync(diffPath);
-            var skills = await LoadSkillsAsync(Path.Combine(Directory.GetCurrentDirectory(), "skills"));
+            var skills = await LoadSkillsAsync(options.SkillsDirectory);
             var apiKey = GetApiKey();
             var prompt = BuildReviewPrompt(skills, diff);
             var reviewJson = await RequestReviewJsonAsync(apiKey, prompt);
@@ -44,14 +45,36 @@ static class ReviewerApp
         }
     }
 
-    private static string GetDiffPath(string[] args)
+    private static ReviewOptions GetOptions(string[] args)
     {
-        if (args.Length != 1)
+        const string usage = "Usage: dotnet reviewer.cs <diff-file> --skills <skills-directory>";
+
+        if (args.Length == 0)
         {
-            throw new ReviewFailureException("Usage: dotnet reviewer.cs <diff-file>");
+            throw new ReviewFailureException($"Missing diff file argument.\n{usage}");
         }
 
-        var diffPath = Path.GetFullPath(args[0]);
+        if (args.Length == 1)
+        {
+            throw new ReviewFailureException($"Missing required --skills <skills-directory>.\n{usage}");
+        }
+
+        if (args.Length == 2 && args[1] == "--skills")
+        {
+            throw new ReviewFailureException($"Missing skills directory after --skills.\n{usage}");
+        }
+
+        if (args.Length != 3 || args[1] != "--skills")
+        {
+            throw new ReviewFailureException($"Invalid arguments.\n{usage}");
+        }
+
+        return new ReviewOptions(args[0], Path.GetFullPath(args[2]));
+    }
+
+    private static string GetDiffPath(string diffFile)
+    {
+        var diffPath = Path.GetFullPath(diffFile);
         if (!File.Exists(diffPath))
         {
             throw new ReviewFailureException($"Diff file not found: {diffPath}");
@@ -67,25 +90,22 @@ static class ReviewerApp
             throw new ReviewFailureException($"Skills directory not found: {skillsDirectory}");
         }
 
-        var skillFiles = Directory.GetFiles(skillsDirectory, "*.md").OrderBy(Path.GetFileName).ToArray();
+        var skillFiles = Directory
+            .EnumerateFiles(skillsDirectory, "SKILL.md", SearchOption.AllDirectories)
+            .OrderBy(skillFile => Path.GetRelativePath(skillsDirectory, skillFile), StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
         if (skillFiles.Length == 0)
         {
-            throw new ReviewFailureException($"No Markdown skills found in: {skillsDirectory}");
+            throw new ReviewFailureException($"No SKILL.md files found in: {skillsDirectory}");
         }
 
         var skills = new List<ReviewSkill>();
         foreach (var skillFile in skillFiles)
         {
             var content = await File.ReadAllTextAsync(skillFile);
-            if (!string.IsNullOrWhiteSpace(content))
-            {
-                skills.Add(new ReviewSkill(Path.GetFileName(skillFile), content.Trim()));
-            }
-        }
-
-        if (skills.Count == 0)
-        {
-            throw new ReviewFailureException($"No non-empty Markdown skills found in: {skillsDirectory}");
+            var skillName = Path.GetRelativePath(skillsDirectory, skillFile).Replace('\\', '/');
+            skills.Add(new ReviewSkill(skillName, content.Trim()));
         }
 
         return skills;
@@ -373,6 +393,8 @@ static class ReviewerApp
 }
 
 sealed class ReviewFailureException(string message) : Exception(message);
+
+record ReviewOptions(string DiffPath, string SkillsDirectory);
 
 record ReviewSkill(string Name, string Content);
 

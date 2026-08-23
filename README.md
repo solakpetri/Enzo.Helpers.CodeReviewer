@@ -1,26 +1,77 @@
 # Enzo.Helpers.CodeReviewer
 
-AI-assisted local code review for unified diff files.
+## Overview
 
-This first version is a .NET 10 C# file-based CLI. It reads a local diff, loads Markdown review skills, asks OpenAI for structured findings, validates the response, and prints a readable review to stdout.
+`Enzo.Helpers.CodeReviewer` is a lightweight AI-assisted code reviewer implemented as a .NET 10 file-based C# application.
 
-GitHub Actions and GitHub Pull Request automation will be added later.
+It reviews unified diffs using external review skills and OpenAI, validates the structured model response, and prints findings to stdout. In GitHub Actions, stdout is visible in the workflow log.
 
-## Requirements
+## Architecture
+
+```text
+GitHub Pull Request
+        |
+        v
+GitHub Actions
+        |
+        v
+PR diff
+        |
+        v
+Enzo.Helpers.CodeReviewer
+        |
+        v
+Enzo.Ai.Skills
+        |
+        v
+OpenAI
+        |
+        v
+Review findings
+```
+
+The current version outputs findings to the GitHub Actions log. PR comments and inline review comments are not implemented yet.
+
+## Enzo.Ai.Skills
+
+Review instructions are maintained separately in the public `Enzo.Ai.Skills` repository.
+
+The reviewer is not coupled to how that repository is obtained. It only receives a filesystem path and recursively discovers files named `SKILL.md`.
+
+Expected convention:
+
+```text
+Enzo.Ai.Skills/
+├── dotnet-backend/
+│   └── SKILL.md
+├── dotnet-testing/
+│   └── SKILL.md
+└── ef-core/
+    └── SKILL.md
+```
+
+Those skill names are examples only. Nested directories are supported, and all discovered `SKILL.md` files are loaded.
+
+## Local Setup
+
+Recommended local workspace:
+
+```text
+workspace/
+├── Enzo.Helpers.CodeReviewer/
+└── Enzo.Ai.Skills/
+```
+
+Requirements:
 
 - .NET 10 SDK with C# file-based app support
-- An OpenAI API key provided through `OPENAI_API_KEY`
 - A unified diff file to review
+- External skills containing at least one `SKILL.md`
+- An OpenAI API key provided through `OPENAI_API_KEY`
 
-## Configure Credentials
+## OpenAI Configuration
 
 The reviewer reads credentials only from `OPENAI_API_KEY`.
-
-Bash:
-
-```bash
-export OPENAI_API_KEY="<your-api-key>"
-```
 
 PowerShell:
 
@@ -28,17 +79,27 @@ PowerShell:
 $env:OPENAI_API_KEY="<your-api-key>"
 ```
 
-Do not store API keys in repository files.
-
-## Run
+Bash:
 
 ```bash
-dotnet reviewer.cs changes.diff
+export OPENAI_API_KEY="<your-api-key>"
 ```
 
-The diff file must exist and should contain the changes to review in unified diff format, such as output from `git diff`.
+Do not store API keys in repository files.
 
-## Example Output
+## Local Usage
+
+Run from the `Enzo.Helpers.CodeReviewer` directory:
+
+```bash
+dotnet reviewer.cs changes.diff --skills ../Enzo.Ai.Skills
+```
+
+`changes.diff` is an existing unified diff file, such as output from `git diff`.
+
+`--skills` points to the external skills directory that contains `SKILL.md` files.
+
+Example output:
 
 ```text
 AI Code Review
@@ -60,21 +121,66 @@ AI Code Review
 No significant issues found.
 ```
 
-## Project Structure
+## GitHub Actions
+
+Pull requests automatically trigger `.github/workflows/review.yml` when they are:
+
+- opened
+- synchronized with new commits
+- reopened
+
+The workflow:
 
 ```text
-Enzo.Helpers.CodeReviewer/
-├── reviewer.cs
-├── README.md
-├── .gitignore
-└── skills/
-    ├── dotnet-backend.md
-    ├── dotnet-testing.md
-    └── ef-core.md
+checks out source
+-> checks out skills
+-> generates diff
+-> runs reviewer
+-> prints findings
 ```
 
-## Review Scope
+It uses GitHub-hosted `ubuntu-latest`, sets up .NET 10, checks out `Enzo.Ai.Skills` with `actions/checkout`, generates the PR diff in `$RUNNER_TEMP/changes.diff`, and runs:
 
-The reviewer focuses on meaningful engineering issues in the supplied changes, including correctness, security, concurrency, async/await misuse, resource leaks, EF Core misuse, database consistency, maintainability, and important missing tests.
+```bash
+dotnet reviewer.cs "$RUNNER_TEMP/changes.diff" --skills ../Enzo.Ai.Skills
+```
 
-It avoids subjective formatting suggestions, trivial naming comments, unchanged-code comments, and speculative issues without evidence in the diff.
+The diff is generated from the pull request base SHA to the pull request head SHA, so the reviewer receives only PR changes. The generated diff file is temporary and is not committed.
+
+## GitHub Secret
+
+Configure this repository secret under GitHub Actions secrets:
+
+```text
+OPENAI_API_KEY
+```
+
+The workflow passes it to the reviewer as:
+
+```yaml
+OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+```
+
+Do not commit the key or place it in repository files.
+
+## Current Limitations
+
+The current version:
+
+- reviews PR diffs
+- loads external skills
+- runs automatically through GitHub Actions
+- prints findings to workflow logs
+
+It does not yet:
+
+- post PR comments
+- create inline review comments
+- approve PRs
+- request changes
+
+## Roadmap
+
+Next milestone: GitHub Pull Request review publishing.
+
+Later milestone: inline review comments.
