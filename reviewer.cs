@@ -9,6 +9,8 @@ return await ReviewerApp.RunAsync(args);
 static class ReviewerApp
 {
     private const string OpenAiEndpoint = "https://api.openai.com/v1/responses";
+    private const string GitHubApiRoot = "https://api.github.com";
+    private const string GitHubUserAgent = "Enzo.Helpers.CodeReviewer";
     private const string Model = "gpt-4.1-mini";
 
     public static async Task<int> RunAsync(string[] args)
@@ -26,6 +28,8 @@ static class ReviewerApp
 
             ValidateReviewResult(review);
             PrintReview(review);
+            var reviewBody = BuildGitHubReviewBody(review);
+            await PublishGitHubReviewAsync(reviewBody);
             return 0;
         }
         catch (ReviewFailureException ex)
@@ -281,6 +285,143 @@ static class ReviewerApp
 
     private static string RedactSecret(string value, string secret) =>
         string.IsNullOrEmpty(secret) ? value : value.Replace(secret, "<redacted>", StringComparison.Ordinal);
+
+    private static string BuildGitHubReviewBody(ReviewResult review)
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine("## 🤖 Automated Code Review");
+
+        if (review.Findings.Count == 0)
+        {
+            builder.AppendLine();
+            builder.AppendLine("No significant issues found.");
+            return builder.ToString().TrimEnd();
+        }
+
+        for (var i = 0; i < review.Findings.Count; i++)
+        {
+            var finding = review.Findings[i];
+            builder.AppendLine();
+            builder.AppendLine($"### {GetSeverityIcon(finding.Severity)} {finding.Title.Trim()}");
+            builder.AppendLine();
+            builder.AppendLine($"`{finding.File.Trim()}:{finding.Line}`");
+            builder.AppendLine();
+            builder.AppendLine(finding.Message.Trim());
+            builder.AppendLine();
+            builder.AppendLine("**Suggestion**");
+            builder.AppendLine();
+            builder.AppendLine(finding.Suggestion.Trim());
+
+            if (i < review.Findings.Count - 1)
+            {
+                builder.AppendLine();
+                builder.AppendLine("---");
+            }
+        }
+
+        return builder.ToString().TrimEnd();
+    }
+
+    private static string GetSeverityIcon(string severity) => severity switch
+    {
+        "high" => "🔴",
+        "medium" => "🟡",
+        "low" => "🔵",
+        _ => "🔵"
+    };
+
+    private static async Task PublishGitHubReviewAsync(string body)
+    {
+        var repository = Environment.GetEnvironmentVariable("GITHUB_REPOSITORY");
+        var pullRequestNumber = Environment.GetEnvironmentVariable("PR_NUMBER");
+        var token = Environment.GetEnvironmentVariable("GITHUB_TOKEN");
+        var isGitHubActions = string.Equals(Environment.GetEnvironmentVariable("GITHUB_ACTIONS"), "true", StringComparison.OrdinalIgnoreCase);
+        var missingValues = new List<string>();
+
+        if (string.IsNullOrWhiteSpace(repository))
+        {
+            missingValues.Add("GITHUB_REPOSITORY");
+        }
+
+        if (string.IsNullOrWhiteSpace(pullRequestNumber))
+        {
+            missingValues.Add("PR_NUMBER");
+        }
+
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            missingValues.Add("GITHUB_TOKEN");
+        }
+
+        if (missingValues.Count > 0)
+        {
+            var missingMessage = $"missing {string.Join(", ", missingValues)}";
+            if (isGitHubActions)
+            {
+                throw new ReviewFailureException($"GitHub review publishing failed: {missingMessage}.");
+            }
+
+            Console.WriteLine();
+            Console.WriteLine($"GitHub review publishing skipped: {missingMessage}.");
+            return;
+        }
+
+        var repositoryParts = repository!.Split('/', 2, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (repositoryParts.Length != 2 || !int.TryParse(pullRequestNumber, out var pullNumber) || pullNumber < 1)
+        {
+            throw new ReviewFailureException("GitHub review publishing failed: invalid GITHUB_REPOSITORY or PR_NUMBER.");
+        }
+
+        using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        httpClient.DefaultRequestHeaders.UserAgent.ParseAdd(GitHubUserAgent);
+        httpClient.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
+
+        var owner = Uri.EscapeDataString(repositoryParts[0]);
+        var repo = Uri.EscapeDataString(repositoryParts[1]);
+        using var request = new HttpRequestMessage(HttpMethod.Post, $"{GitHubApiRoot}/repos/{owner}/{repo}/pulls/{pullNumber}/reviews")
+        {
+            Content = new StringContent(CreateGitHubReviewRequestJson(body), Encoding.UTF8, "application/json")
+        };
+
+        using var response = await httpClient.SendAsync(request);
+        var responseBody = await response.Content.ReadAsStringAsync();
+
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new ReviewFailureException($"GitHub review publishing failed ({(int)response.StatusCode} {response.ReasonPhrase}): {GetGitHubErrorMessage(responseBody, token!)}");
+        }
+
+        Console.WriteLine();
+        Console.WriteLine("GitHub Pull Request Review published.");
+    }
+
+    private static string CreateGitHubReviewRequestJson(string body) => $$"""
+        {
+          "body": {{JsonString(body)}},
+          "event": "COMMENT"
+        }
+        """;
+
+    private static string GetGitHubErrorMessage(string responseBody, string token)
+    {
+        var redactedBody = RedactSecret(responseBody, token);
+        try
+        {
+            using var document = JsonDocument.Parse(redactedBody);
+            if (document.RootElement.TryGetProperty("message", out var message)
+                && message.ValueKind == JsonValueKind.String)
+            {
+                return message.GetString() ?? "No error details returned.";
+            }
+        }
+        catch (JsonException)
+        {
+            return string.IsNullOrWhiteSpace(redactedBody) ? "No error details returned." : redactedBody;
+        }
+
+        return string.IsNullOrWhiteSpace(redactedBody) ? "No error details returned." : redactedBody;
+    }
 
     private static ReviewResult ParseReviewResult(string reviewJson)
     {
