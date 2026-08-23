@@ -17,25 +17,35 @@ jobs:
       - name: Checkout repository being reviewed
         uses: actions/checkout@v4
         with:
+          path: source
           fetch-depth: 0
+
+      - name: Checkout code reviewer
+        uses: actions/checkout@v4
+        with:
+          repository: solakpetri/Enzo.Helpers.CodeReviewer
+          ref: main
+          path: reviewer
+
+      - name: Checkout AI skills
+        uses: actions/checkout@v4
+        with:
+          repository: solakpetri/Enzo.Ai.Skills
+          ref: main
+          path: skills
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
 
-      - name: Checkout AI skills
-        uses: actions/checkout@v4
-        with:
-          repository: solakpetri/Enzo.Ai.Skills
-          path: Enzo.Ai.Skills
-
       - name: Generate PR diff
+        working-directory: source
         run: |
-          git diff "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" > changes.diff
+          git diff "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" > ../changes.diff
 
       - name: Run code reviewer
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          dotnet reviewer.cs changes.diff --skills Enzo.Ai.Skills
+          dotnet reviewer/reviewer.cs changes.diff --skills skills
