@@ -1,58 +1,41 @@
 name: AI Code Review
 
 on:
-  pull_request:
-    types:
-      - opened
-      - synchronize
-      - reopened
+  workflow_call:
+    secrets:
+      OPENAI_API_KEY:
+        required: true
 
 permissions:
   contents: read
 
 jobs:
   review:
-    name: Review pull request
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout source
+      - name: Checkout repository being reviewed
         uses: actions/checkout@v4
         with:
-          path: Enzo.Helpers.CodeReviewer
           fetch-depth: 0
-          persist-credentials: true
 
-      - name: Checkout review skills
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Checkout AI skills
         uses: actions/checkout@v4
         with:
           repository: solakpetri/Enzo.Ai.Skills
           path: Enzo.Ai.Skills
-          persist-credentials: true
-
-      - name: Set up .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 10.0.x
 
       - name: Generate PR diff
-        shell: bash
-        working-directory: Enzo.Helpers.CodeReviewer
         run: |
-          git fetch --no-tags --prune origin \
-            "+refs/pull/${{ github.event.pull_request.number }}/head:refs/remotes/origin/pr-head"
+          git diff "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" > changes.diff
 
-          test "$(git rev-parse refs/remotes/origin/pr-head)" = \
-            "${{ github.event.pull_request.head.sha }}"
-
-          git diff --no-ext-diff --binary \
-            "${{ github.event.pull_request.base.sha }}" \
-            "${{ github.event.pull_request.head.sha }}" \
-            > "$RUNNER_TEMP/changes.diff"
-
-      - name: Run AI code review
-        shell: bash
-        working-directory: Enzo.Helpers.CodeReviewer
+      - name: Run code reviewer
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: dotnet reviewer.cs "$RUNNER_TEMP/changes.diff" --skills ../Enzo.Ai.Skills
+        run: |
+          dotnet reviewer.cs changes.diff --skills Enzo.Ai.Skills
