@@ -1,5 +1,6 @@
 #nullable enable
 
+using System.Globalization;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -577,14 +578,42 @@ static class ReviewerApp
         builder.AppendLine("# 🤖 Enzo Code Reviewer");
         builder.AppendLine();
 
-        if (review.Findings.Count > 0)
+        if (review.Findings.Count == 0)
         {
-            builder.AppendLine("## 🔍 Issues Found");
+            if (review.Advice.Count > 0)
+            {
+                AppendAdvice(builder, review.Advice);
+            }
+            else
+            {
+                builder.AppendLine("## ✨ Good job!");
+                builder.AppendLine();
+                builder.AppendLine("No actionable issues or specific recommendations found. 🚀");
+            }
+
+            return builder.ToString().TrimEnd();
+        }
+
+        builder.AppendLine("## 🔍 Issues Found");
+        builder.AppendLine();
+
+        foreach (var severity in new[] { "high", "medium", "low" })
+        {
+            var findings = review.Findings
+                .Where(finding => finding.Severity == severity)
+                .ToList();
+            if (findings.Count == 0)
+            {
+                continue;
+            }
+
+            builder.AppendLine($"### {GetSeverityIcon(severity)} {severity.ToUpperInvariant()}");
             builder.AppendLine();
 
-            foreach (var finding in review.Findings)
+            for (var i = 0; i < findings.Count; i++)
             {
-                builder.AppendLine($"### {GetSeverityIcon(finding.Severity)} {finding.Title.Trim()}");
+                var finding = findings[i];
+                builder.AppendLine($"#### {i + 1}. {finding.Title.Trim()}");
                 builder.AppendLine();
                 builder.AppendLine($"**Location:** `{finding.File}:{finding.Line}`");
                 builder.AppendLine();
@@ -596,22 +625,54 @@ static class ReviewerApp
                 builder.AppendLine();
                 builder.AppendLine("**Agent Prompt**");
                 builder.AppendLine();
-                builder.AppendLine($"> {finding.AgentPrompt.Trim()}");
+                AppendBlockQuote(builder, finding.AgentPrompt.Trim());
                 builder.AppendLine();
             }
-        }
-        else if (review.Advice.Count > 0)
-        {
-            AppendAdvice(builder, review.Advice);
-        }
-        else
-        {
-            builder.AppendLine("## ✨ Good job!");
+
+            builder.AppendLine("---");
             builder.AppendLine();
-            builder.AppendLine("No actionable issues or specific recommendations found. 🚀");
+        }
+
+        AppendStatistics(builder, BuildReviewStatistics(review.Findings, addedLines));
+
+        if (review.Advice.Count > 0)
+        {
+            builder.AppendLine();
+            AppendAdvice(builder, review.Advice);
         }
 
         return builder.ToString().TrimEnd();
+    }
+
+    private static ReviewStatistics BuildReviewStatistics(IReadOnlyCollection<ReviewFinding> findings, int addedLines)
+    {
+        var high = findings.Count(finding => finding.Severity == "high");
+        var medium = findings.Count(finding => finding.Severity == "medium");
+        var low = findings.Count(finding => finding.Severity == "low");
+        return new ReviewStatistics(addedLines, findings.Count, high, medium, low);
+    }
+
+    private static void AppendStatistics(StringBuilder builder, ReviewStatistics statistics)
+    {
+        builder.AppendLine("## 📊 Statistics");
+        builder.AppendLine();
+        builder.AppendLine($"**Added lines:** {statistics.AddedLines}  ");
+        builder.AppendLine($"**Issues found:** {statistics.TotalIssues}  ");
+        builder.AppendLine($"**Issue density:** {FormatIssueDensity(statistics)}");
+        builder.AppendLine();
+        builder.AppendLine("### Severity Distribution");
+        builder.AppendLine();
+        builder.AppendLine($"- 🔴 High: {statistics.HighCount} — {FormatSeverityPercent(statistics.HighCount, statistics.TotalIssues)}");
+        builder.AppendLine($"- 🟡 Medium: {statistics.MediumCount} — {FormatSeverityPercent(statistics.MediumCount, statistics.TotalIssues)}");
+        builder.AppendLine($"- 🔵 Low: {statistics.LowCount} — {FormatSeverityPercent(statistics.LowCount, statistics.TotalIssues)}");
+        builder.AppendLine();
+        builder.AppendLine("```mermaid");
+        builder.AppendLine("pie showData");
+        builder.AppendLine("    title Issue Severity");
+        builder.AppendLine($"    \"High\" : {statistics.HighCount}");
+        builder.AppendLine($"    \"Medium\" : {statistics.MediumCount}");
+        builder.AppendLine($"    \"Low\" : {statistics.LowCount}");
+        builder.AppendLine("```");
     }
 
     private static void AppendAdvice(StringBuilder builder, IReadOnlyCollection<ReviewAdvice> advice)
@@ -623,6 +684,25 @@ static class ReviewerApp
             builder.AppendLine($"- {item.Message.Trim()}");
         }
     }
+
+    private static void AppendBlockQuote(StringBuilder builder, string value)
+    {
+        using var reader = new StringReader(value);
+        for (var line = reader.ReadLine(); line is not null; line = reader.ReadLine())
+        {
+            builder.AppendLine($"> {line}");
+        }
+    }
+
+    private static string FormatIssueDensity(ReviewStatistics statistics) =>
+        statistics.AddedLines == 0
+            ? "N/A"
+            : $"{FormatDecimal(statistics.TotalIssues / (double)statistics.AddedLines * 100)} findings per 100 added lines";
+
+    private static string FormatSeverityPercent(int count, int total) =>
+        total == 0 ? "0.0%" : $"{FormatDecimal(count / (double)total * 100)}%";
+
+    private static string FormatDecimal(double value) => value.ToString("0.0", CultureInfo.InvariantCulture);
 
     private static ReviewResult ParseReviewResult(string reviewJson)
     {
@@ -811,6 +891,45 @@ static class ReviewerApp
         Assert(comments.Count == 2, "valid findings should become inline comments");
         Assert(comments.All(comment => comment.Side == "RIGHT"), "inline comments should target the right side of the diff");
 
+        var report = BuildReviewReport(valid.Review, diffInfo.AddedLineCount);
+        Assert(report.Contains("## 🔍 Issues Found", StringComparison.Ordinal), "report should include issues section when findings exist");
+        Assert(report.Contains("### 🔴 HIGH", StringComparison.Ordinal), "report should include high findings");
+        Assert(report.Contains("### 🟡 MEDIUM", StringComparison.Ordinal), "report should include medium findings");
+        Assert(report.Contains("### 🔵 LOW", StringComparison.Ordinal), "report should include low findings");
+        Assert(report.Contains("#### 1. High finding", StringComparison.Ordinal), "numbering should start at one for high severity");
+        Assert(report.Contains("#### 1. Medium invalid line", StringComparison.Ordinal), "numbering should reset for medium severity");
+        Assert(report.Contains("#### 1. Low invalid file", StringComparison.Ordinal), "numbering should reset for low severity");
+        Assert(report.Contains("**Action**", StringComparison.Ordinal), "each issue should show an action");
+        Assert(report.Contains("**Agent Prompt**", StringComparison.Ordinal), "each issue should show an agent prompt");
+        Assert(report.Contains("**Added lines:** 4", StringComparison.Ordinal), "statistics should show added lines");
+        Assert(report.Contains("**Issues found:** 4", StringComparison.Ordinal), "statistics should show issue count");
+        Assert(report.Contains("**Issue density:** 100.0 findings per 100 added lines", StringComparison.Ordinal), "statistics should show issue density");
+        Assert(report.Contains("🔴 High: 1 — 25.0%", StringComparison.Ordinal), "statistics should show high percentage");
+        Assert(report.Contains("🟡 Medium: 1 — 25.0%", StringComparison.Ordinal), "statistics should show medium percentage");
+        Assert(report.Contains("🔵 Low: 2 — 50.0%", StringComparison.Ordinal), "statistics should show low percentage");
+        Assert(report.Contains("```mermaid", StringComparison.Ordinal), "statistics should include Mermaid chart");
+        Assert(report.Contains("## 💡 Advice", StringComparison.Ordinal), "report should include advice when findings and advice exist");
+
+        var noMedium = BuildReviewReport(new ReviewResult([
+            new ReviewFinding("src/Foo.cs", 11, "high", "Only high", "Message", "Action", "Prompt"),
+            new ReviewFinding("src/Bar.cs", 2, "low", "Only low", "Message", "Action", "Prompt")
+        ], []), diffInfo.AddedLineCount);
+        Assert(!noMedium.Contains("### 🟡 MEDIUM", StringComparison.Ordinal), "severity sections with zero findings should be omitted");
+
+        var zeroAddedReport = BuildReviewReport(new ReviewResult([
+            new ReviewFinding("src/Foo.cs", 11, "high", "Zero added", "Message", "Action", "Prompt")
+        ], []), 0);
+        Assert(zeroAddedReport.Contains("**Issue density:** N/A", StringComparison.Ordinal), "zero added lines should avoid density division");
+
+        var adviceOnlyReport = BuildReviewReport(new ReviewResult([], [new ReviewAdvice("Use the built-in framework API here to reduce custom code.")]), diffInfo.AddedLineCount);
+        Assert(!adviceOnlyReport.Contains("## 🔍 Issues Found", StringComparison.Ordinal), "advice-only report should omit issues");
+        Assert(!adviceOnlyReport.Contains("## 📊 Statistics", StringComparison.Ordinal), "advice-only report should omit statistics");
+        Assert(adviceOnlyReport.Contains("## 💡 Advice", StringComparison.Ordinal), "advice-only report should include advice");
+
+        var goodJobReport = BuildReviewReport(new ReviewResult([], []), diffInfo.AddedLineCount);
+        Assert(goodJobReport.Contains("## ✨ Good job!", StringComparison.Ordinal), "empty review should include good job fallback");
+        Assert(!goodJobReport.Contains("## 📊 Statistics", StringComparison.Ordinal), "empty review should omit statistics");
+
         Console.WriteLine("Self-tests passed.");
         return 0;
     }
@@ -852,5 +971,7 @@ record ReviewFinding(
     string AgentPrompt);
 
 record ReviewAdvice(string Message);
+
+record ReviewStatistics(int AddedLines, int TotalIssues, int HighCount, int MediumCount, int LowCount);
 
 record GitHubReviewComment(string Path, int Line, string Side, string Body);
