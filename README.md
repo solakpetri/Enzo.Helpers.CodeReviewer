@@ -4,7 +4,7 @@
 
 `Enzo.Helpers.CodeReviewer` is a lightweight AI-assisted code reviewer implemented as a .NET 10 file-based C# application.
 
-It reviews pull request diffs using external review skills and OpenAI, validates the structured model response against the actual diff, prints actionable findings to stdout, and posts valid findings as inline advisory GitHub Pull Request Review comments using the Enzo Code Reviewer GitHub App identity.
+It reviews pull request diffs using external review skills and OpenAI, validates inline comment locations against the actual diff, prints a structured review report to stdout, and posts an advisory GitHub Pull Request Review report using the Enzo Code Reviewer GitHub App identity.
 
 ## Architecture
 
@@ -25,16 +25,26 @@ Code Reviewer
         v
 OpenAI
         |
-        | returns structured review findings
+        | returns structured findings and advice
         v
-Inline GitHub Pull Request Review comments
+GitHub Pull Request Review report plus valid inline issue comments
 ```
 
 The GitHub review is always submitted with the `COMMENT` event. It does not approve PRs, request changes, or block merges.
 
 OpenAI performs the review analysis. `Enzo.Ai.Skills` provides external review guidance. The Enzo Code Reviewer GitHub App provides the GitHub identity used to publish PR reviews.
 
-The reviewer intentionally reports only concrete, actionable issues introduced or exposed by the pull request. Praise, positive observations, summaries of good code, stylistic preferences, and optional suggestions without a concrete benefit are omitted. If there are no actionable issues, no PR review comment is published.
+The reviewer intentionally separates issues from advice:
+
+```text
+Issues
+-> actionable problems worth fixing
+
+Advice
+-> useful non-blocking recommendations
+```
+
+Every successful GitHub Actions review publishes an overall Enzo Code Reviewer PR report. Valid issue locations may also receive inline comments for local context. Advice is included only in the overall report and is not posted inline.
 
 ## Enzo.Ai.Skills
 
@@ -103,31 +113,87 @@ dotnet reviewer.cs changes.diff --skills ../Enzo.Ai.Skills
 
 `--skills` points to the external skills directory that contains `SKILL.md` files.
 
-Local review generation does not require GitHub App credentials. If GitHub publishing context is unavailable, the reviewer prints valid findings and skips publishing as before.
+Local review generation does not require GitHub App credentials. If GitHub publishing context is unavailable, the reviewer prints the same logical report and skips GitHub publishing.
 
 Example output:
 
-```text
-AI Code Review
+````markdown
+# 🤖 Enzo Code Reviewer
 
-[HIGH] src/Repositories/UserRepository.cs:42
-Concurrent DbContext usage
+## 🔍 Issues Found
+
+### 🔴 HIGH
+
+#### 1. Concurrent DbContext usage
+
+**Location:** `src/Repositories/UserRepository.cs:42`
 
 Multiple EF Core operations are being started concurrently on the same DbContext.
 
-Suggestion:
-Execute them sequentially or use independent DbContext instances.
-```
+**Action**
 
-If no actionable issues are found:
+Execute them sequentially or use independent DbContext instances.
+
+**Agent Prompt**
+
+> Fix the concurrent DbContext usage in src/Repositories/UserRepository.cs around line 42. Preserve existing behavior and add focused validation.
+
+---
+
+## 📊 Statistics
+
+**Added lines:** 80
+**Issues found:** 1
+**Issue density:** 1.3 findings per 100 added lines
+
+### Severity Distribution
+
+- 🔴 High: 1 — 100.0%
+- 🟡 Medium: 0 — 0.0%
+- 🔵 Low: 0 — 0.0%
+
+```mermaid
+pie showData
+    title Issue Severity
+    "High" : 1
+    "Medium" : 0
+    "Low" : 0
+```
+````
+
+If there are findings, they are grouped in this order: HIGH, MEDIUM, LOW. Numbering resets inside each severity group, and severities with zero findings are omitted from the Issues Found section. Each issue includes a location, explanation, action, and directly usable coding-agent prompt.
+
+The Statistics section is calculated by the application, not by the model. Added lines are counted from the unified diff across files and hunks while excluding diff headers, `+++` lines, deleted lines, and metadata.
+
+Issue density means:
 
 ```text
-AI Code Review
-
-No actionable issues found.
+findings / added lines * 100
 ```
 
-Findings are validated against `changes.diff` before printing or publishing. A finding is kept only when its file exists in the diff and its line is an added or changed new/right-side line that can be used for an inline GitHub review comment. Invalid or stale model locations are skipped with a concise log message instead of being moved to an unrelated line.
+It is displayed as `findings per 100 added lines`. It is not an estimate of what percentage of the code is defective. If there are zero added lines, issue density is displayed as `N/A`.
+
+If there are no issues but useful advice exists:
+
+```markdown
+# 🤖 Enzo Code Reviewer
+
+## 💡 Advice
+
+- Using AsNoTracking() here would avoid unnecessary EF Core tracking because this query is read-only.
+```
+
+If there are no issues and no useful advice:
+
+```markdown
+# 🤖 Enzo Code Reviewer
+
+## ✨ Good job!
+
+No actionable issues or specific recommendations found. 🚀
+```
+
+Findings are validated against `changes.diff` before creating inline comments. A finding with a valid changed new/right-side line may appear both in the report and as an inline GitHub review comment. If a model-provided location is invalid or stale, only the inline comment is omitted; the issue remains in the overall report.
 
 ## GitHub Actions
 
@@ -178,8 +244,9 @@ checks out source
 -> generates diff
 -> creates an Enzo Code Reviewer GitHub App installation token
 -> runs reviewer
--> prints valid actionable findings
--> posts one COMMENT pull request review with inline comments as the Enzo Code Reviewer GitHub App
+-> prints the Enzo Code Reviewer report
+-> posts one COMMENT pull request review report as the Enzo Code Reviewer GitHub App
+-> includes valid inline issue comments in the same review where possible
 ```
 
 It uses GitHub-hosted `ubuntu-latest`, sets up .NET 10, checks out `Enzo.Ai.Skills` with `actions/checkout`, generates the PR diff, and runs:
@@ -188,7 +255,7 @@ It uses GitHub-hosted `ubuntu-latest`, sets up .NET 10, checks out `Enzo.Ai.Skil
 dotnet reviewer/reviewer.cs changes.diff --skills skills
 ```
 
-The diff is generated from the pull request base SHA to the pull request head SHA, so the reviewer receives only PR changes. The generated diff file is not committed. The reviewer parses this unified diff to determine valid new/right-side inline comment targets and filters out invalid model-provided locations before calling GitHub.
+The diff is generated from the pull request base SHA to the pull request head SHA, so the reviewer receives only PR changes. The generated diff file is not committed. The reviewer parses this unified diff to count added lines for statistics and determine valid new/right-side inline comment targets.
 
 The reusable workflow grants only the permissions needed to read repository contents and write pull request reviews:
 
@@ -253,10 +320,11 @@ The current version:
 - reviews PR diffs
 - loads external skills
 - runs through a reusable GitHub Actions workflow
-- prints valid actionable findings to workflow logs
-- posts inline GitHub Pull Request Review comments using `COMMENT` as the Enzo Code Reviewer GitHub App
-- filters invalid model locations against the actual PR diff
-- publishes no PR review when there are zero actionable findings or no valid inline findings remain after validation
+- prints the structured Enzo Code Reviewer report to workflow logs
+- posts a GitHub Pull Request Review report using `COMMENT` as the Enzo Code Reviewer GitHub App
+- includes inline comments for issues with valid changed-line locations
+- keeps invalid-location issues in the report while omitting only their inline comments
+- publishes advice-only and Good Job fallback reports when there are no issues
 - never approves PRs or requests changes
 
 Current limitations:

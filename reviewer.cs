@@ -1,5 +1,6 @@
 #nullable enable
 
+using System.Globalization;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
@@ -25,7 +26,7 @@ static class ReviewerApp
             var options = GetOptions(args);
             var diffPath = GetDiffPath(options.DiffPath);
             var diff = await File.ReadAllTextAsync(diffPath);
-            var diffTargets = ParseUnifiedDiff(diff);
+            var diffInfo = ParseUnifiedDiff(diff);
             var skills = await LoadSkillsAsync(options.SkillsDirectory);
             var apiKey = GetApiKey();
             var prompt = BuildReviewPrompt(skills, diff);
@@ -33,9 +34,10 @@ static class ReviewerApp
             var review = ParseReviewResult(reviewJson);
 
             ValidateReviewResult(review);
-            var validReview = ValidateFindingsAgainstDiff(review, diffTargets);
-            PrintReview(validReview);
-            await PublishGitHubReviewAsync(validReview.Findings);
+            var validation = ValidateFindingsAgainstDiff(review, diffInfo.ChangedLines);
+            var report = BuildReviewReport(validation.Review, diffInfo.AddedLineCount);
+            PrintReview(report);
+            await PublishGitHubReviewAsync(report, validation.InlineFindings);
             return 0;
         }
         catch (ReviewFailureException ex)
@@ -138,10 +140,13 @@ static class ReviewerApp
         builder.AppendLine("You are an AI-assisted code reviewer for .NET changes.");
         builder.AppendLine();
         builder.AppendLine("Review only the supplied PR diff. Findings must refer to changed lines from the diff and must use the new/right-side line number whenever possible.");
-        builder.AppendLine("Return only concrete, actionable problems introduced or exposed by the pull request. If there are no actionable issues, return an empty findings array.");
+        builder.AppendLine("Return findings and advice separately. Findings are actionable issues worth fixing. Advice is useful non-blocking guidance specific to the changed code.");
+        builder.AppendLine("Return only concrete, actionable problems introduced or exposed by the pull request as findings. If there are no actionable issues, return an empty findings array.");
         builder.AppendLine("Prioritize correctness bugs, security vulnerabilities, concurrency problems, race conditions, async misuse, resource leaks, EF Core misuse, database consistency issues, broken error handling, meaningful architectural violations, important missing validation, significant performance problems, and missing tests where changed behavior creates meaningful regression risk.");
         builder.AppendLine("Do not report praise, positive observations, code summaries, things the code does correctly, compliments, stylistic preferences, formatting, naming trivia, subjective refactoring preferences, optional improvements without a concrete benefit, unchanged code, speculative problems without a plausible failure mode, or comments merely to demonstrate inspection.");
-        builder.AppendLine("Every finding must represent something the developer should reasonably consider fixing. Do not manufacture findings so the review has content.");
+        builder.AppendLine("Every finding must represent something the developer should reasonably consider fixing. Do not manufacture findings so the review has content. Do not convert optional advice into low-severity findings.");
+        builder.AppendLine("Every finding must include an action and a directly usable coding-agent prompt. The prompt must identify the file and problem, describe the expected correction, ask to preserve unrelated behavior, request focused validation or tests where appropriate, and avoid unrelated refactoring. Do not include credentials, secrets, or unnecessary repository information.");
+        builder.AppendLine("Advice may discuss better framework APIs, .NET 10 features, modern replacements, maintainability improvements, meaningful performance improvements, or useful framework capabilities. Advice must be concrete, relevant to the changed code, and omitted when there is no useful PR-specific recommendation.");
         builder.AppendLine("External review skills may help identify problems, but these issue-only instructions are authoritative.");
         builder.AppendLine();
         builder.AppendLine("Severity must be exactly one of: high, medium, low.");
@@ -200,24 +205,36 @@ static class ReviewerApp
               "schema": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["findings"],
-                "properties": {
-                  "findings": {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "additionalProperties": false,
-                      "required": ["file", "line", "severity", "title", "message", "suggestion"],
-                      "properties": {
-                        "file": { "type": "string" },
-                        "line": { "type": "integer", "minimum": 1 },
-                        "severity": { "type": "string", "enum": ["high", "medium", "low"] },
-                        "title": { "type": "string" },
-                        "message": { "type": "string" },
-                        "suggestion": { "type": "string" }
+                  "required": ["findings", "advice"],
+                  "properties": {
+                    "findings": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["file", "line", "severity", "title", "message", "action", "agent_prompt"],
+                        "properties": {
+                          "file": { "type": "string" },
+                          "line": { "type": "integer", "minimum": 1 },
+                          "severity": { "type": "string", "enum": ["high", "medium", "low"] },
+                          "title": { "type": "string" },
+                          "message": { "type": "string" },
+                          "action": { "type": "string" },
+                          "agent_prompt": { "type": "string" }
+                        }
+                      }
+                    },
+                    "advice": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["message"],
+                        "properties": {
+                          "message": { "type": "string" }
+                        }
                       }
                     }
-                  }
                 }
               }
             }
@@ -294,46 +311,46 @@ static class ReviewerApp
     private static string RedactSecret(string value, string secret) =>
         string.IsNullOrEmpty(secret) ? value : value.Replace(secret, "<redacted>", StringComparison.Ordinal);
 
-    private static ReviewResult ValidateFindingsAgainstDiff(ReviewResult review, IReadOnlyDictionary<string, HashSet<int>> diffTargets)
+    private static ReviewValidationResult ValidateFindingsAgainstDiff(ReviewResult review, IReadOnlyDictionary<string, HashSet<int>> diffTargets)
     {
-        if (review.Findings.Count == 0)
-        {
-            return review;
-        }
-
-        var validFindings = new List<ReviewFinding>();
+        var normalizedFindings = new List<ReviewFinding>();
+        var inlineFindings = new List<ReviewFinding>();
         foreach (var finding in review.Findings)
         {
             var file = NormalizeFindingPath(finding.File);
+            var normalizedFinding = finding with { File = file };
+            normalizedFindings.Add(normalizedFinding);
+
             if (!diffTargets.TryGetValue(file, out var validLines))
             {
-                Console.WriteLine($"Skipped finding with unmapped diff location: {finding.File}:{finding.Line} was not found in the PR diff.");
+                Console.WriteLine($"Skipped inline comment for unmapped diff location: {finding.File}:{finding.Line} was not found in the PR diff.");
                 continue;
             }
 
             if (!validLines.Contains(finding.Line))
             {
-                Console.WriteLine($"Skipped finding with unmapped diff location: {finding.File}:{finding.Line} is not a changed right-side line.");
+                Console.WriteLine($"Skipped inline comment for unmapped diff location: {finding.File}:{finding.Line} is not a changed right-side line.");
                 continue;
             }
 
-            validFindings.Add(finding with { File = file });
+            inlineFindings.Add(normalizedFinding);
         }
 
-        if (validFindings.Count == 0)
+        if (review.Findings.Count > 0 && inlineFindings.Count == 0)
         {
             Console.WriteLine("No valid inline findings remained after diff validation.");
         }
 
-        return new ReviewResult(validFindings);
+        return new ReviewValidationResult(new ReviewResult(normalizedFindings, review.Advice), inlineFindings);
     }
 
-    private static Dictionary<string, HashSet<int>> ParseUnifiedDiff(string diff)
+    private static DiffInfo ParseUnifiedDiff(string diff)
     {
         var files = new Dictionary<string, HashSet<int>>(StringComparer.Ordinal);
         string? currentFile = null;
         var newLine = 0;
         var inHunk = false;
+        var addedLines = 0;
 
         using var reader = new StringReader(diff);
         for (var line = reader.ReadLine(); line is not null; line = reader.ReadLine())
@@ -370,6 +387,7 @@ static class ReviewerApp
             if (line[0] == '+')
             {
                 files[currentFile].Add(newLine);
+                addedLines++;
                 newLine++;
             }
             else if (line[0] == ' ')
@@ -378,7 +396,7 @@ static class ReviewerApp
             }
         }
 
-        return files;
+        return new DiffInfo(files, addedLines);
     }
 
     private static int ParseNewLineStart(string hunkHeader)
@@ -430,7 +448,7 @@ static class ReviewerApp
             .ToList();
 
     private static string BuildInlineCommentBody(ReviewFinding finding) =>
-        $"{GetSeverityIcon(finding.Severity)} **{finding.Title.Trim()}**\n\n{finding.Message.Trim()}\n\n**Suggestion:** {finding.Suggestion.Trim()}";
+        $"{GetSeverityIcon(finding.Severity)} **{finding.Title.Trim()}**\n\n{finding.Message.Trim()}\n\n**Action:** {finding.Action.Trim()}";
 
     private static string GetSeverityIcon(string severity) => severity switch
     {
@@ -440,14 +458,9 @@ static class ReviewerApp
         _ => "🔵"
     };
 
-    private static async Task PublishGitHubReviewAsync(IReadOnlyCollection<ReviewFinding> findings)
+    private static async Task PublishGitHubReviewAsync(string report, IReadOnlyCollection<ReviewFinding> inlineFindings)
     {
-        if (findings.Count == 0)
-        {
-            return;
-        }
-
-        var comments = BuildGitHubReviewComments(findings);
+        var comments = BuildGitHubReviewComments(inlineFindings);
         var repository = Environment.GetEnvironmentVariable("GITHUB_REPOSITORY");
         var pullRequestNumber = Environment.GetEnvironmentVariable("PR_NUMBER");
         var token = Environment.GetEnvironmentVariable("GITHUB_TOKEN");
@@ -497,7 +510,7 @@ static class ReviewerApp
         var repo = Uri.EscapeDataString(repositoryParts[1]);
         using var request = new HttpRequestMessage(HttpMethod.Post, $"{GitHubApiRoot}/repos/{owner}/{repo}/pulls/{pullNumber}/reviews")
         {
-            Content = new StringContent(CreateGitHubReviewRequestJson(comments), Encoding.UTF8, "application/json")
+            Content = new StringContent(CreateGitHubReviewRequestJson(report, comments), Encoding.UTF8, "application/json")
         };
 
         using var response = await httpClient.SendAsync(request);
@@ -512,12 +525,13 @@ static class ReviewerApp
         Console.WriteLine($"GitHub Pull Request Review published with {comments.Count} inline comment(s).");
     }
 
-    private static string CreateGitHubReviewRequestJson(IReadOnlyCollection<GitHubReviewComment> comments)
+    private static string CreateGitHubReviewRequestJson(string report, IReadOnlyCollection<GitHubReviewComment> comments)
     {
         using var stream = new MemoryStream();
         using (var writer = new Utf8JsonWriter(stream))
         {
             writer.WriteStartObject();
+            writer.WriteString("body", report);
             writer.WriteString("event", "COMMENT");
             writer.WriteStartArray("comments");
 
@@ -558,6 +572,138 @@ static class ReviewerApp
         return string.IsNullOrWhiteSpace(redactedBody) ? "No error details returned." : redactedBody;
     }
 
+    private static string BuildReviewReport(ReviewResult review, int addedLines)
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine("# 🤖 Enzo Code Reviewer");
+        builder.AppendLine();
+
+        if (review.Findings.Count == 0)
+        {
+            if (review.Advice.Count > 0)
+            {
+                AppendAdvice(builder, review.Advice);
+            }
+            else
+            {
+                builder.AppendLine("## ✨ Good job!");
+                builder.AppendLine();
+                builder.AppendLine("No actionable issues or specific recommendations found. 🚀");
+            }
+
+            return builder.ToString().TrimEnd();
+        }
+
+        builder.AppendLine("## 🔍 Issues Found");
+        builder.AppendLine();
+
+        foreach (var severity in new[] { "high", "medium", "low" })
+        {
+            var findings = review.Findings
+                .Where(finding => finding.Severity == severity)
+                .ToList();
+            if (findings.Count == 0)
+            {
+                continue;
+            }
+
+            builder.AppendLine($"### {GetSeverityIcon(severity)} {severity.ToUpperInvariant()}");
+            builder.AppendLine();
+
+            for (var i = 0; i < findings.Count; i++)
+            {
+                var finding = findings[i];
+                builder.AppendLine($"#### {i + 1}. {finding.Title.Trim()}");
+                builder.AppendLine();
+                builder.AppendLine($"**Location:** `{finding.File}:{finding.Line}`");
+                builder.AppendLine();
+                builder.AppendLine(finding.Message.Trim());
+                builder.AppendLine();
+                builder.AppendLine("**Action**");
+                builder.AppendLine();
+                builder.AppendLine(finding.Action.Trim());
+                builder.AppendLine();
+                builder.AppendLine("**Agent Prompt**");
+                builder.AppendLine();
+                AppendBlockQuote(builder, finding.AgentPrompt.Trim());
+                builder.AppendLine();
+            }
+
+            builder.AppendLine("---");
+            builder.AppendLine();
+        }
+
+        AppendStatistics(builder, BuildReviewStatistics(review.Findings, addedLines));
+
+        if (review.Advice.Count > 0)
+        {
+            builder.AppendLine();
+            AppendAdvice(builder, review.Advice);
+        }
+
+        return builder.ToString().TrimEnd();
+    }
+
+    private static ReviewStatistics BuildReviewStatistics(IReadOnlyCollection<ReviewFinding> findings, int addedLines)
+    {
+        var high = findings.Count(finding => finding.Severity == "high");
+        var medium = findings.Count(finding => finding.Severity == "medium");
+        var low = findings.Count(finding => finding.Severity == "low");
+        return new ReviewStatistics(addedLines, findings.Count, high, medium, low);
+    }
+
+    private static void AppendStatistics(StringBuilder builder, ReviewStatistics statistics)
+    {
+        builder.AppendLine("## 📊 Statistics");
+        builder.AppendLine();
+        builder.AppendLine($"**Added lines:** {statistics.AddedLines}  ");
+        builder.AppendLine($"**Issues found:** {statistics.TotalIssues}  ");
+        builder.AppendLine($"**Issue density:** {FormatIssueDensity(statistics)}");
+        builder.AppendLine();
+        builder.AppendLine("### Severity Distribution");
+        builder.AppendLine();
+        builder.AppendLine($"- 🔴 High: {statistics.HighCount} — {FormatSeverityPercent(statistics.HighCount, statistics.TotalIssues)}");
+        builder.AppendLine($"- 🟡 Medium: {statistics.MediumCount} — {FormatSeverityPercent(statistics.MediumCount, statistics.TotalIssues)}");
+        builder.AppendLine($"- 🔵 Low: {statistics.LowCount} — {FormatSeverityPercent(statistics.LowCount, statistics.TotalIssues)}");
+        builder.AppendLine();
+        builder.AppendLine("```mermaid");
+        builder.AppendLine("pie showData");
+        builder.AppendLine("    title Issue Severity");
+        builder.AppendLine($"    \"High\" : {statistics.HighCount}");
+        builder.AppendLine($"    \"Medium\" : {statistics.MediumCount}");
+        builder.AppendLine($"    \"Low\" : {statistics.LowCount}");
+        builder.AppendLine("```");
+    }
+
+    private static void AppendAdvice(StringBuilder builder, IReadOnlyCollection<ReviewAdvice> advice)
+    {
+        builder.AppendLine("## 💡 Advice");
+        builder.AppendLine();
+        foreach (var item in advice)
+        {
+            builder.AppendLine($"- {item.Message.Trim()}");
+        }
+    }
+
+    private static void AppendBlockQuote(StringBuilder builder, string value)
+    {
+        using var reader = new StringReader(value);
+        for (var line = reader.ReadLine(); line is not null; line = reader.ReadLine())
+        {
+            builder.AppendLine($"> {line}");
+        }
+    }
+
+    private static string FormatIssueDensity(ReviewStatistics statistics) =>
+        statistics.AddedLines == 0
+            ? "N/A"
+            : $"{FormatDecimal(statistics.TotalIssues / (double)statistics.AddedLines * 100)} findings per 100 added lines";
+
+    private static string FormatSeverityPercent(int count, int total) =>
+        total == 0 ? "0.0%" : $"{FormatDecimal(count / (double)total * 100)}%";
+
+    private static string FormatDecimal(double value) => value.ToString("0.0", CultureInfo.InvariantCulture);
+
     private static ReviewResult ParseReviewResult(string reviewJson)
     {
         using var document = JsonDocument.Parse(reviewJson);
@@ -583,10 +729,28 @@ static class ReviewerApp
                 ReadRequiredString(findingElement, "severity"),
                 ReadRequiredString(findingElement, "title"),
                 ReadRequiredString(findingElement, "message"),
-                ReadRequiredString(findingElement, "suggestion")));
+                ReadRequiredString(findingElement, "action"),
+                ReadRequiredString(findingElement, "agent_prompt")));
         }
 
-        return new ReviewResult(findings);
+        if (!root.TryGetProperty("advice", out var adviceElement)
+            || adviceElement.ValueKind != JsonValueKind.Array)
+        {
+            throw new ReviewFailureException("Malformed model response: advice array is missing.");
+        }
+
+        var advice = new List<ReviewAdvice>();
+        foreach (var adviceItem in adviceElement.EnumerateArray())
+        {
+            if (adviceItem.ValueKind != JsonValueKind.Object)
+            {
+                throw new ReviewFailureException("Malformed model response: advice must be an object.");
+            }
+
+            advice.Add(new ReviewAdvice(ReadRequiredString(adviceItem, "message")));
+        }
+
+        return new ReviewResult(findings, advice);
     }
 
     private static string ReadRequiredString(JsonElement element, string propertyName)
@@ -616,6 +780,11 @@ static class ReviewerApp
             throw new ReviewFailureException("Invalid review result: findings is missing.");
         }
 
+        if (review.Advice is null)
+        {
+            throw new ReviewFailureException("Invalid review result: advice is missing.");
+        }
+
         for (var i = 0; i < review.Findings.Count; i++)
         {
             var finding = review.Findings[i];
@@ -636,35 +805,25 @@ static class ReviewerApp
 
             if (string.IsNullOrWhiteSpace(finding.Title)
                 || string.IsNullOrWhiteSpace(finding.Message)
-                || string.IsNullOrWhiteSpace(finding.Suggestion))
+                || string.IsNullOrWhiteSpace(finding.Action)
+                || string.IsNullOrWhiteSpace(finding.AgentPrompt))
             {
-                throw new ReviewFailureException($"Invalid review finding {i + 1}: title, message, and suggestion are required.");
+                throw new ReviewFailureException($"Invalid review finding {i + 1}: title, message, action, and agent prompt are required.");
+            }
+        }
+
+        for (var i = 0; i < review.Advice.Count; i++)
+        {
+            if (string.IsNullOrWhiteSpace(review.Advice[i].Message))
+            {
+                throw new ReviewFailureException($"Invalid review advice {i + 1}: message is required.");
             }
         }
     }
 
-    private static void PrintReview(ReviewResult review)
+    private static void PrintReview(string report)
     {
-        Console.WriteLine("AI Code Review");
-        Console.WriteLine();
-
-        if (review.Findings.Count == 0)
-        {
-            Console.WriteLine("No actionable issues found.");
-            return;
-        }
-
-        foreach (var finding in review.Findings)
-        {
-            Console.WriteLine($"[{finding.Severity.ToUpperInvariant()}] {finding.File}:{finding.Line}");
-            Console.WriteLine(finding.Title);
-            Console.WriteLine();
-            Console.WriteLine(finding.Message);
-            Console.WriteLine();
-            Console.WriteLine("Suggestion:");
-            Console.WriteLine(finding.Suggestion);
-            Console.WriteLine();
-        }
+        Console.WriteLine(report);
     }
 
     private static int RunSelfTests()
@@ -702,33 +861,74 @@ static class ReviewerApp
             -deleted two
             """;
 
-        var targets = ParseUnifiedDiff(diff);
-        AssertTarget(targets, "src/Foo.cs", 11, expected: true, "added line");
-        AssertTarget(targets, "src/Foo.cs", 13, expected: true, "second added line");
-        AssertTarget(targets, "src/Foo.cs", 32, expected: true, "multiple hunks");
-        AssertTarget(targets, "src/Bar.cs", 2, expected: true, "multiple files");
-        AssertTarget(targets, "src/Foo.cs", 10, expected: false, "context line");
-        AssertTarget(targets, "src/Foo.cs", 12, expected: false, "context after deletion");
-        AssertTarget(targets, "src/Foo.cs", 31, expected: false, "later context line");
-        AssertTarget(targets, "src/Deleted.cs", 1, expected: false, "deleted file line");
+        var diffInfo = ParseUnifiedDiff(diff);
+        Assert(diffInfo.AddedLineCount == 4, "added-line counting should include added lines across files and hunks only");
+        AssertTarget(diffInfo.ChangedLines, "src/Foo.cs", 11, expected: true, "added line");
+        AssertTarget(diffInfo.ChangedLines, "src/Foo.cs", 13, expected: true, "second added line");
+        AssertTarget(diffInfo.ChangedLines, "src/Foo.cs", 32, expected: true, "multiple hunks");
+        AssertTarget(diffInfo.ChangedLines, "src/Bar.cs", 2, expected: true, "multiple files");
+        AssertTarget(diffInfo.ChangedLines, "src/Foo.cs", 10, expected: false, "context line");
+        AssertTarget(diffInfo.ChangedLines, "src/Foo.cs", 12, expected: false, "context after deletion");
+        AssertTarget(diffInfo.ChangedLines, "src/Foo.cs", 31, expected: false, "later context line");
+        AssertTarget(diffInfo.ChangedLines, "src/Deleted.cs", 1, expected: false, "deleted file line");
 
         var mixed = new ReviewResult([
-            new ReviewFinding("src/Foo.cs", 11, "high", "Valid", "Message", "Suggestion"),
-            new ReviewFinding("src/Foo.cs", 12, "medium", "Invalid line", "Message", "Suggestion"),
-            new ReviewFinding("missing/File.cs", 1, "low", "Invalid file", "Message", "Suggestion"),
-            new ReviewFinding("b/src/Bar.cs", 2, "low", "Valid prefixed path", "Message", "Suggestion")
-        ]);
+            new ReviewFinding("src/Foo.cs", 11, "high", "High finding", "Message", "Fix it", "Fix src/Foo.cs around line 11. Preserve behavior and add focused tests."),
+            new ReviewFinding("src/Foo.cs", 12, "medium", "Medium invalid line", "Message", "Fix it", "Fix src/Foo.cs around line 12. Preserve behavior and add focused tests."),
+            new ReviewFinding("missing/File.cs", 1, "low", "Low invalid file", "Message", "Fix it", "Fix missing/File.cs around line 1. Preserve behavior and add focused tests."),
+            new ReviewFinding("b/src/Bar.cs", 2, "low", "Low valid prefixed path", "Message", "Fix it", "Fix src/Bar.cs around line 2. Preserve behavior and add focused tests.")
+        ], [new ReviewAdvice("Using AsNoTracking() here would avoid unnecessary EF Core tracking because this query is read-only.")]);
 
-        var valid = ValidateFindingsAgainstDiff(mixed, targets);
-        Assert(valid.Findings.Count == 2, "mixture of valid and invalid findings should keep only valid entries");
-        Assert(valid.Findings[1].File == "src/Bar.cs", "finding paths should be normalized for GitHub comments");
+        var valid = ValidateFindingsAgainstDiff(mixed, diffInfo.ChangedLines);
+        Assert(valid.Review.Findings.Count == 4, "invalid inline locations should remain in the overall report");
+        Assert(valid.InlineFindings.Count == 2, "only valid locations should become inline findings");
+        Assert(valid.Review.Findings[3].File == "src/Bar.cs", "finding paths should be normalized in reports");
 
-        var zero = ValidateFindingsAgainstDiff(new ReviewResult([]), targets);
-        Assert(zero.Findings.Count == 0, "zero findings should remain zero");
+        var zero = ValidateFindingsAgainstDiff(new ReviewResult([], []), diffInfo.ChangedLines);
+        Assert(zero.Review.Findings.Count == 0, "zero findings should remain zero");
 
-        var comments = BuildGitHubReviewComments(valid.Findings);
+        var comments = BuildGitHubReviewComments(valid.InlineFindings);
         Assert(comments.Count == 2, "valid findings should become inline comments");
         Assert(comments.All(comment => comment.Side == "RIGHT"), "inline comments should target the right side of the diff");
+
+        var report = BuildReviewReport(valid.Review, diffInfo.AddedLineCount);
+        Assert(report.Contains("## 🔍 Issues Found", StringComparison.Ordinal), "report should include issues section when findings exist");
+        Assert(report.Contains("### 🔴 HIGH", StringComparison.Ordinal), "report should include high findings");
+        Assert(report.Contains("### 🟡 MEDIUM", StringComparison.Ordinal), "report should include medium findings");
+        Assert(report.Contains("### 🔵 LOW", StringComparison.Ordinal), "report should include low findings");
+        Assert(report.Contains("#### 1. High finding", StringComparison.Ordinal), "numbering should start at one for high severity");
+        Assert(report.Contains("#### 1. Medium invalid line", StringComparison.Ordinal), "numbering should reset for medium severity");
+        Assert(report.Contains("#### 1. Low invalid file", StringComparison.Ordinal), "numbering should reset for low severity");
+        Assert(report.Contains("**Action**", StringComparison.Ordinal), "each issue should show an action");
+        Assert(report.Contains("**Agent Prompt**", StringComparison.Ordinal), "each issue should show an agent prompt");
+        Assert(report.Contains("**Added lines:** 4", StringComparison.Ordinal), "statistics should show added lines");
+        Assert(report.Contains("**Issues found:** 4", StringComparison.Ordinal), "statistics should show issue count");
+        Assert(report.Contains("**Issue density:** 100.0 findings per 100 added lines", StringComparison.Ordinal), "statistics should show issue density");
+        Assert(report.Contains("🔴 High: 1 — 25.0%", StringComparison.Ordinal), "statistics should show high percentage");
+        Assert(report.Contains("🟡 Medium: 1 — 25.0%", StringComparison.Ordinal), "statistics should show medium percentage");
+        Assert(report.Contains("🔵 Low: 2 — 50.0%", StringComparison.Ordinal), "statistics should show low percentage");
+        Assert(report.Contains("```mermaid", StringComparison.Ordinal), "statistics should include Mermaid chart");
+        Assert(report.Contains("## 💡 Advice", StringComparison.Ordinal), "report should include advice when findings and advice exist");
+
+        var noMedium = BuildReviewReport(new ReviewResult([
+            new ReviewFinding("src/Foo.cs", 11, "high", "Only high", "Message", "Action", "Prompt"),
+            new ReviewFinding("src/Bar.cs", 2, "low", "Only low", "Message", "Action", "Prompt")
+        ], []), diffInfo.AddedLineCount);
+        Assert(!noMedium.Contains("### 🟡 MEDIUM", StringComparison.Ordinal), "severity sections with zero findings should be omitted");
+
+        var zeroAddedReport = BuildReviewReport(new ReviewResult([
+            new ReviewFinding("src/Foo.cs", 11, "high", "Zero added", "Message", "Action", "Prompt")
+        ], []), 0);
+        Assert(zeroAddedReport.Contains("**Issue density:** N/A", StringComparison.Ordinal), "zero added lines should avoid density division");
+
+        var adviceOnlyReport = BuildReviewReport(new ReviewResult([], [new ReviewAdvice("Use the built-in framework API here to reduce custom code.")]), diffInfo.AddedLineCount);
+        Assert(!adviceOnlyReport.Contains("## 🔍 Issues Found", StringComparison.Ordinal), "advice-only report should omit issues");
+        Assert(!adviceOnlyReport.Contains("## 📊 Statistics", StringComparison.Ordinal), "advice-only report should omit statistics");
+        Assert(adviceOnlyReport.Contains("## 💡 Advice", StringComparison.Ordinal), "advice-only report should include advice");
+
+        var goodJobReport = BuildReviewReport(new ReviewResult([], []), diffInfo.AddedLineCount);
+        Assert(goodJobReport.Contains("## ✨ Good job!", StringComparison.Ordinal), "empty review should include good job fallback");
+        Assert(!goodJobReport.Contains("## 📊 Statistics", StringComparison.Ordinal), "empty review should omit statistics");
 
         Console.WriteLine("Self-tests passed.");
         return 0;
@@ -755,7 +955,11 @@ record ReviewOptions(string DiffPath, string SkillsDirectory);
 
 record ReviewSkill(string Name, string Content);
 
-record ReviewResult(List<ReviewFinding> Findings);
+record DiffInfo(Dictionary<string, HashSet<int>> ChangedLines, int AddedLineCount);
+
+record ReviewValidationResult(ReviewResult Review, List<ReviewFinding> InlineFindings);
+
+record ReviewResult(List<ReviewFinding> Findings, List<ReviewAdvice> Advice);
 
 record ReviewFinding(
     string File,
@@ -763,6 +967,11 @@ record ReviewFinding(
     string Severity,
     string Title,
     string Message,
-    string Suggestion);
+    string Action,
+    string AgentPrompt);
+
+record ReviewAdvice(string Message);
+
+record ReviewStatistics(int AddedLines, int TotalIssues, int HighCount, int MediumCount, int LowCount);
 
 record GitHubReviewComment(string Path, int Line, string Side, string Body);
