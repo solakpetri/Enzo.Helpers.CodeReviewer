@@ -4,7 +4,7 @@
 
 `Enzo.Helpers.CodeReviewer` is a lightweight AI-assisted code reviewer implemented as a .NET 10 file-based C# application.
 
-It reviews pull request diffs using external review skills and OpenAI, validates the structured model response, prints findings to stdout, and posts the findings as an advisory GitHub Pull Request Review using the Enzo Code Reviewer GitHub App identity.
+It reviews pull request diffs using external review skills and OpenAI, validates the structured model response against the actual diff, prints actionable findings to stdout, and posts valid findings as inline advisory GitHub Pull Request Review comments using the Enzo Code Reviewer GitHub App identity.
 
 ## Architecture
 
@@ -27,12 +27,14 @@ OpenAI
         |
         | returns structured review findings
         v
-GitHub Pull Request Review
+Inline GitHub Pull Request Review comments
 ```
 
-The GitHub review is always submitted with the `COMMENT` event. It does not approve PRs or request changes.
+The GitHub review is always submitted with the `COMMENT` event. It does not approve PRs, request changes, or block merges.
 
 OpenAI performs the review analysis. `Enzo.Ai.Skills` provides external review guidance. The Enzo Code Reviewer GitHub App provides the GitHub identity used to publish PR reviews.
+
+The reviewer intentionally reports only concrete, actionable issues introduced or exposed by the pull request. Praise, positive observations, summaries of good code, stylistic preferences, and optional suggestions without a concrete benefit are omitted. If there are no actionable issues, no PR review comment is published.
 
 ## Enzo.Ai.Skills
 
@@ -101,7 +103,7 @@ dotnet reviewer.cs changes.diff --skills ../Enzo.Ai.Skills
 
 `--skills` points to the external skills directory that contains `SKILL.md` files.
 
-Local review generation does not require GitHub App credentials. If GitHub publishing context is unavailable, the reviewer prints the review and skips publishing as before.
+Local review generation does not require GitHub App credentials. If GitHub publishing context is unavailable, the reviewer prints valid findings and skips publishing as before.
 
 Example output:
 
@@ -117,13 +119,15 @@ Suggestion:
 Execute them sequentially or use independent DbContext instances.
 ```
 
-If no significant issues are found:
+If no actionable issues are found:
 
 ```text
 AI Code Review
 
-No significant issues found.
+No actionable issues found.
 ```
+
+Findings are validated against `changes.diff` before printing or publishing. A finding is kept only when its file exists in the diff and its line is an added or changed new/right-side line that can be used for an inline GitHub review comment. Invalid or stale model locations are skipped with a concise log message instead of being moved to an unrelated line.
 
 ## GitHub Actions
 
@@ -174,8 +178,8 @@ checks out source
 -> generates diff
 -> creates an Enzo Code Reviewer GitHub App installation token
 -> runs reviewer
--> prints findings
--> posts a COMMENT pull request review as the Enzo Code Reviewer GitHub App
+-> prints valid actionable findings
+-> posts one COMMENT pull request review with inline comments as the Enzo Code Reviewer GitHub App
 ```
 
 It uses GitHub-hosted `ubuntu-latest`, sets up .NET 10, checks out `Enzo.Ai.Skills` with `actions/checkout`, generates the PR diff, and runs:
@@ -184,7 +188,7 @@ It uses GitHub-hosted `ubuntu-latest`, sets up .NET 10, checks out `Enzo.Ai.Skil
 dotnet reviewer/reviewer.cs changes.diff --skills skills
 ```
 
-The diff is generated from the pull request base SHA to the pull request head SHA, so the reviewer receives only PR changes. The generated diff file is not committed.
+The diff is generated from the pull request base SHA to the pull request head SHA, so the reviewer receives only PR changes. The generated diff file is not committed. The reviewer parses this unified diff to determine valid new/right-side inline comment targets and filters out invalid model-provided locations before calling GitHub.
 
 The reusable workflow grants only the permissions needed to read repository contents and write pull request reviews:
 
@@ -232,7 +236,7 @@ The private key is provided only to the token-generation step. The generated ins
 GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
 ```
 
-The reviewer does not understand GitHub App authentication. It only uses `GITHUB_TOKEN` to publish the existing GitHub Pull Request Review request.
+The reviewer does not understand GitHub App authentication. It only uses `GITHUB_TOKEN` to publish the GitHub Pull Request Review request.
 
 The OpenAI API key is passed to the reviewer unchanged:
 
@@ -249,17 +253,16 @@ The current version:
 - reviews PR diffs
 - loads external skills
 - runs through a reusable GitHub Actions workflow
-- prints findings to workflow logs
-- posts a GitHub Pull Request Review using `COMMENT` as the Enzo Code Reviewer GitHub App
+- prints valid actionable findings to workflow logs
+- posts inline GitHub Pull Request Review comments using `COMMENT` as the Enzo Code Reviewer GitHub App
+- filters invalid model locations against the actual PR diff
+- publishes no PR review when there are zero actionable findings or no valid inline findings remain after validation
 - never approves PRs or requests changes
 
 Current limitations:
 
-- create inline review comments
 - manage duplicate reviews
 
 ## Roadmap
 
-Duplicate-review handling is planned for a later version.
-
-Later milestone: inline review comments.
+Duplicate-review handling is planned for a later version. Manually re-running the workflow can create duplicate inline comments.

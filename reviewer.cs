@@ -17,9 +17,15 @@ static class ReviewerApp
     {
         try
         {
+            if (args.Length == 1 && args[0] == "--self-test")
+            {
+                return RunSelfTests();
+            }
+
             var options = GetOptions(args);
             var diffPath = GetDiffPath(options.DiffPath);
             var diff = await File.ReadAllTextAsync(diffPath);
+            var diffTargets = ParseUnifiedDiff(diff);
             var skills = await LoadSkillsAsync(options.SkillsDirectory);
             var apiKey = GetApiKey();
             var prompt = BuildReviewPrompt(skills, diff);
@@ -27,9 +33,9 @@ static class ReviewerApp
             var review = ParseReviewResult(reviewJson);
 
             ValidateReviewResult(review);
-            PrintReview(review);
-            var reviewBody = BuildGitHubReviewBody(review);
-            await PublishGitHubReviewAsync(reviewBody);
+            var validReview = ValidateFindingsAgainstDiff(review, diffTargets);
+            PrintReview(validReview);
+            await PublishGitHubReviewAsync(validReview.Findings);
             return 0;
         }
         catch (ReviewFailureException ex)
@@ -131,13 +137,15 @@ static class ReviewerApp
         var builder = new StringBuilder();
         builder.AppendLine("You are an AI-assisted code reviewer for .NET changes.");
         builder.AppendLine();
-        builder.AppendLine("Review only the supplied diff. Focus on evidence in changed lines and their immediate context.");
-        builder.AppendLine("Prioritize correctness bugs, security vulnerabilities, concurrency problems, async/await misuse, resource leaks, EF Core misuse, database consistency issues, architectural problems, significant maintainability problems, and missing important tests.");
-        builder.AppendLine("Avoid subjective formatting suggestions, personal coding preferences, trivial naming comments, comments about unchanged code, and speculative issues without evidence from the diff.");
-        builder.AppendLine("Return only findings that are significant enough for a human reviewer to act on.");
+        builder.AppendLine("Review only the supplied PR diff. Findings must refer to changed lines from the diff and must use the new/right-side line number whenever possible.");
+        builder.AppendLine("Return only concrete, actionable problems introduced or exposed by the pull request. If there are no actionable issues, return an empty findings array.");
+        builder.AppendLine("Prioritize correctness bugs, security vulnerabilities, concurrency problems, race conditions, async misuse, resource leaks, EF Core misuse, database consistency issues, broken error handling, meaningful architectural violations, important missing validation, significant performance problems, and missing tests where changed behavior creates meaningful regression risk.");
+        builder.AppendLine("Do not report praise, positive observations, code summaries, things the code does correctly, compliments, stylistic preferences, formatting, naming trivia, subjective refactoring preferences, optional improvements without a concrete benefit, unchanged code, speculative problems without a plausible failure mode, or comments merely to demonstrate inspection.");
+        builder.AppendLine("Every finding must represent something the developer should reasonably consider fixing. Do not manufacture findings so the review has content.");
+        builder.AppendLine("External review skills may help identify problems, but these issue-only instructions are authoritative.");
         builder.AppendLine();
         builder.AppendLine("Severity must be exactly one of: high, medium, low.");
-        builder.AppendLine("Line must refer to the changed line in the new file when possible. Use the closest changed line when the issue spans multiple lines.");
+        builder.AppendLine("File must be a path from the supplied diff. Line must be a changed new/right-side line from that file. Do not invent locations outside the diff.");
         builder.AppendLine();
         builder.AppendLine("Review skills:");
 
@@ -286,41 +294,143 @@ static class ReviewerApp
     private static string RedactSecret(string value, string secret) =>
         string.IsNullOrEmpty(secret) ? value : value.Replace(secret, "<redacted>", StringComparison.Ordinal);
 
-    private static string BuildGitHubReviewBody(ReviewResult review)
+    private static ReviewResult ValidateFindingsAgainstDiff(ReviewResult review, IReadOnlyDictionary<string, HashSet<int>> diffTargets)
     {
-        var builder = new StringBuilder();
-        builder.AppendLine("## 🤖 Automated Code Review");
-
         if (review.Findings.Count == 0)
         {
-            builder.AppendLine();
-            builder.AppendLine("No significant issues found.");
-            return builder.ToString().TrimEnd();
+            return review;
         }
 
-        for (var i = 0; i < review.Findings.Count; i++)
+        var validFindings = new List<ReviewFinding>();
+        foreach (var finding in review.Findings)
         {
-            var finding = review.Findings[i];
-            builder.AppendLine();
-            builder.AppendLine($"### {GetSeverityIcon(finding.Severity)} {finding.Title.Trim()}");
-            builder.AppendLine();
-            builder.AppendLine($"`{finding.File.Trim()}:{finding.Line}`");
-            builder.AppendLine();
-            builder.AppendLine(finding.Message.Trim());
-            builder.AppendLine();
-            builder.AppendLine("**Suggestion**");
-            builder.AppendLine();
-            builder.AppendLine(finding.Suggestion.Trim());
-
-            if (i < review.Findings.Count - 1)
+            var file = NormalizeFindingPath(finding.File);
+            if (!diffTargets.TryGetValue(file, out var validLines))
             {
-                builder.AppendLine();
-                builder.AppendLine("---");
+                Console.WriteLine($"Skipped finding with unmapped diff location: {finding.File}:{finding.Line} was not found in the PR diff.");
+                continue;
+            }
+
+            if (!validLines.Contains(finding.Line))
+            {
+                Console.WriteLine($"Skipped finding with unmapped diff location: {finding.File}:{finding.Line} is not a changed right-side line.");
+                continue;
+            }
+
+            validFindings.Add(finding with { File = file });
+        }
+
+        if (validFindings.Count == 0)
+        {
+            Console.WriteLine("No valid inline findings remained after diff validation.");
+        }
+
+        return new ReviewResult(validFindings);
+    }
+
+    private static Dictionary<string, HashSet<int>> ParseUnifiedDiff(string diff)
+    {
+        var files = new Dictionary<string, HashSet<int>>(StringComparer.Ordinal);
+        string? currentFile = null;
+        var newLine = 0;
+        var inHunk = false;
+
+        using var reader = new StringReader(diff);
+        for (var line = reader.ReadLine(); line is not null; line = reader.ReadLine())
+        {
+            if (line.StartsWith("+++ ", StringComparison.Ordinal))
+            {
+                currentFile = NormalizeDiffPath(line[4..]);
+                inHunk = false;
+                if (currentFile is not null && !files.ContainsKey(currentFile))
+                {
+                    files[currentFile] = [];
+                }
+
+                continue;
+            }
+
+            if (currentFile is null)
+            {
+                continue;
+            }
+
+            if (line.StartsWith("@@ ", StringComparison.Ordinal))
+            {
+                newLine = ParseNewLineStart(line);
+                inHunk = newLine > 0;
+                continue;
+            }
+
+            if (!inHunk || line.Length == 0 || line[0] == '\\')
+            {
+                continue;
+            }
+
+            if (line[0] == '+')
+            {
+                files[currentFile].Add(newLine);
+                newLine++;
+            }
+            else if (line[0] == ' ')
+            {
+                newLine++;
             }
         }
 
-        return builder.ToString().TrimEnd();
+        return files;
     }
+
+    private static int ParseNewLineStart(string hunkHeader)
+    {
+        var plusIndex = hunkHeader.IndexOf('+', StringComparison.Ordinal);
+        if (plusIndex < 0)
+        {
+            return 0;
+        }
+
+        var startIndex = plusIndex + 1;
+        var endIndex = startIndex;
+        while (endIndex < hunkHeader.Length && char.IsDigit(hunkHeader[endIndex]))
+        {
+            endIndex++;
+        }
+
+        return int.TryParse(hunkHeader[startIndex..endIndex], out var start) ? start : 0;
+    }
+
+    private static string? NormalizeDiffPath(string path)
+    {
+        var normalized = path.Trim();
+        if (normalized == "/dev/null")
+        {
+            return null;
+        }
+
+        normalized = TrimQuotedPath(normalized).Replace('\\', '/');
+        return normalized.StartsWith("a/", StringComparison.Ordinal) || normalized.StartsWith("b/", StringComparison.Ordinal)
+            ? normalized[2..]
+            : normalized;
+    }
+
+    private static string NormalizeFindingPath(string path)
+    {
+        var normalized = TrimQuotedPath(path.Trim()).Replace('\\', '/');
+        return normalized.StartsWith("a/", StringComparison.Ordinal) || normalized.StartsWith("b/", StringComparison.Ordinal)
+            ? normalized[2..]
+            : normalized;
+    }
+
+    private static string TrimQuotedPath(string path) =>
+        path.Length >= 2 && path[0] == '"' && path[^1] == '"' ? path[1..^1] : path;
+
+    private static List<GitHubReviewComment> BuildGitHubReviewComments(IReadOnlyCollection<ReviewFinding> findings) =>
+        findings
+            .Select(finding => new GitHubReviewComment(finding.File, finding.Line, "RIGHT", BuildInlineCommentBody(finding)))
+            .ToList();
+
+    private static string BuildInlineCommentBody(ReviewFinding finding) =>
+        $"{GetSeverityIcon(finding.Severity)} **{finding.Title.Trim()}**\n\n{finding.Message.Trim()}\n\n**Suggestion:** {finding.Suggestion.Trim()}";
 
     private static string GetSeverityIcon(string severity) => severity switch
     {
@@ -330,8 +440,14 @@ static class ReviewerApp
         _ => "🔵"
     };
 
-    private static async Task PublishGitHubReviewAsync(string body)
+    private static async Task PublishGitHubReviewAsync(IReadOnlyCollection<ReviewFinding> findings)
     {
+        if (findings.Count == 0)
+        {
+            return;
+        }
+
+        var comments = BuildGitHubReviewComments(findings);
         var repository = Environment.GetEnvironmentVariable("GITHUB_REPOSITORY");
         var pullRequestNumber = Environment.GetEnvironmentVariable("PR_NUMBER");
         var token = Environment.GetEnvironmentVariable("GITHUB_TOKEN");
@@ -381,7 +497,7 @@ static class ReviewerApp
         var repo = Uri.EscapeDataString(repositoryParts[1]);
         using var request = new HttpRequestMessage(HttpMethod.Post, $"{GitHubApiRoot}/repos/{owner}/{repo}/pulls/{pullNumber}/reviews")
         {
-            Content = new StringContent(CreateGitHubReviewRequestJson(body), Encoding.UTF8, "application/json")
+            Content = new StringContent(CreateGitHubReviewRequestJson(comments), Encoding.UTF8, "application/json")
         };
 
         using var response = await httpClient.SendAsync(request);
@@ -393,15 +509,34 @@ static class ReviewerApp
         }
 
         Console.WriteLine();
-        Console.WriteLine("GitHub Pull Request Review published.");
+        Console.WriteLine($"GitHub Pull Request Review published with {comments.Count} inline comment(s).");
     }
 
-    private static string CreateGitHubReviewRequestJson(string body) => $$"""
+    private static string CreateGitHubReviewRequestJson(IReadOnlyCollection<GitHubReviewComment> comments)
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream))
         {
-          "body": {{JsonString(body)}},
-          "event": "COMMENT"
+            writer.WriteStartObject();
+            writer.WriteString("event", "COMMENT");
+            writer.WriteStartArray("comments");
+
+            foreach (var comment in comments)
+            {
+                writer.WriteStartObject();
+                writer.WriteString("path", comment.Path);
+                writer.WriteNumber("line", comment.Line);
+                writer.WriteString("side", comment.Side);
+                writer.WriteString("body", comment.Body);
+                writer.WriteEndObject();
+            }
+
+            writer.WriteEndArray();
+            writer.WriteEndObject();
         }
-        """;
+
+        return Encoding.UTF8.GetString(stream.ToArray());
+    }
 
     private static string GetGitHubErrorMessage(string responseBody, string token)
     {
@@ -515,7 +650,7 @@ static class ReviewerApp
 
         if (review.Findings.Count == 0)
         {
-            Console.WriteLine("No significant issues found.");
+            Console.WriteLine("No actionable issues found.");
             return;
         }
 
@@ -529,6 +664,87 @@ static class ReviewerApp
             Console.WriteLine("Suggestion:");
             Console.WriteLine(finding.Suggestion);
             Console.WriteLine();
+        }
+    }
+
+    private static int RunSelfTests()
+    {
+        var diff = """
+            diff --git a/src/Foo.cs b/src/Foo.cs
+            index 1111111..2222222 100644
+            --- a/src/Foo.cs
+            +++ b/src/Foo.cs
+            @@ -10,4 +10,5 @@ public class Foo
+             context one
+            -removed old line
+            +added first line
+             context two
+            +added second line
+            @@ -30,2 +31,3 @@ public class Foo
+             later context
+            +later added line
+             later context two
+            diff --git a/src/Bar.cs b/src/Bar.cs
+            index 3333333..4444444 100644
+            --- a/src/Bar.cs
+            +++ b/src/Bar.cs
+            @@ -1,2 +1,3 @@ public class Bar
+             bar context
+            +bar added line
+             bar context two
+            diff --git a/src/Deleted.cs b/src/Deleted.cs
+            deleted file mode 100644
+            index 5555555..0000000
+            --- a/src/Deleted.cs
+            +++ /dev/null
+            @@ -1,2 +0,0 @@
+            -deleted one
+            -deleted two
+            """;
+
+        var targets = ParseUnifiedDiff(diff);
+        AssertTarget(targets, "src/Foo.cs", 11, expected: true, "added line");
+        AssertTarget(targets, "src/Foo.cs", 13, expected: true, "second added line");
+        AssertTarget(targets, "src/Foo.cs", 32, expected: true, "multiple hunks");
+        AssertTarget(targets, "src/Bar.cs", 2, expected: true, "multiple files");
+        AssertTarget(targets, "src/Foo.cs", 10, expected: false, "context line");
+        AssertTarget(targets, "src/Foo.cs", 12, expected: false, "context after deletion");
+        AssertTarget(targets, "src/Foo.cs", 31, expected: false, "later context line");
+        AssertTarget(targets, "src/Deleted.cs", 1, expected: false, "deleted file line");
+
+        var mixed = new ReviewResult([
+            new ReviewFinding("src/Foo.cs", 11, "high", "Valid", "Message", "Suggestion"),
+            new ReviewFinding("src/Foo.cs", 12, "medium", "Invalid line", "Message", "Suggestion"),
+            new ReviewFinding("missing/File.cs", 1, "low", "Invalid file", "Message", "Suggestion"),
+            new ReviewFinding("b/src/Bar.cs", 2, "low", "Valid prefixed path", "Message", "Suggestion")
+        ]);
+
+        var valid = ValidateFindingsAgainstDiff(mixed, targets);
+        Assert(valid.Findings.Count == 2, "mixture of valid and invalid findings should keep only valid entries");
+        Assert(valid.Findings[1].File == "src/Bar.cs", "finding paths should be normalized for GitHub comments");
+
+        var zero = ValidateFindingsAgainstDiff(new ReviewResult([]), targets);
+        Assert(zero.Findings.Count == 0, "zero findings should remain zero");
+
+        var comments = BuildGitHubReviewComments(valid.Findings);
+        Assert(comments.Count == 2, "valid findings should become inline comments");
+        Assert(comments.All(comment => comment.Side == "RIGHT"), "inline comments should target the right side of the diff");
+
+        Console.WriteLine("Self-tests passed.");
+        return 0;
+    }
+
+    private static void AssertTarget(IReadOnlyDictionary<string, HashSet<int>> targets, string file, int line, bool expected, string scenario)
+    {
+        var actual = targets.TryGetValue(file, out var lines) && lines.Contains(line);
+        Assert(actual == expected, $"Unexpected target validity for {scenario}: {file}:{line}.");
+    }
+
+    private static void Assert(bool condition, string message)
+    {
+        if (!condition)
+        {
+            throw new ReviewFailureException($"Self-test failed: {message}");
         }
     }
 }
@@ -548,3 +764,5 @@ record ReviewFinding(
     string Title,
     string Message,
     string Suggestion);
+
+record GitHubReviewComment(string Path, int Line, string Side, string Body);
