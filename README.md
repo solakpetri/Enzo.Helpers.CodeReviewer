@@ -142,8 +142,8 @@ Execute them sequentially or use independent DbContext instances.
 
 ## 📊 Statistics
 
-**Added lines:** 80  
-**Issues found:** 1  
+**Added lines:** 80
+**Issues found:** 1
 **Issue density:** 1.3 findings per 100 added lines
 
 ### Severity Distribution
