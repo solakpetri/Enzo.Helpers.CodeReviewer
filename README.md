@@ -4,27 +4,35 @@
 
 `Enzo.Helpers.CodeReviewer` is a lightweight AI-assisted code reviewer implemented as a .NET 10 file-based C# application.
 
-It reviews pull request diffs using external review skills and OpenAI, validates the structured model response, prints findings to stdout, and posts the findings as an advisory GitHub Pull Request Review.
+It reviews pull request diffs using external review skills and OpenAI, validates the structured model response, prints findings to stdout, and posts the findings as an advisory GitHub Pull Request Review using the Enzo Code Reviewer GitHub App identity.
 
 ## Architecture
 
 ```text
-PR
+Consuming repository
         |
+        | OPENAI_API_KEY
+        | Enzo Code Reviewer GitHub App ID
+        | Enzo Code Reviewer GitHub App private key
         v
-GitHub Actions
+Reusable GitHub Actions workflow
         |
+        | creates installation token
         v
 Code Reviewer
         |
+        | sends PR diff and review skills
         v
 OpenAI
         |
+        | returns structured review findings
         v
 GitHub Pull Request Review
 ```
 
 The GitHub review is always submitted with the `COMMENT` event. It does not approve PRs or request changes.
+
+OpenAI performs the review analysis. `Enzo.Ai.Skills` provides external review guidance. The Enzo Code Reviewer GitHub App provides the GitHub identity used to publish PR reviews.
 
 ## Enzo.Ai.Skills
 
@@ -65,7 +73,7 @@ Requirements:
 
 ## OpenAI Configuration
 
-The reviewer reads credentials only from `OPENAI_API_KEY`.
+For review analysis, the reviewer reads OpenAI credentials from `OPENAI_API_KEY`.
 
 PowerShell:
 
@@ -93,6 +101,8 @@ dotnet reviewer.cs changes.diff --skills ../Enzo.Ai.Skills
 
 `--skills` points to the external skills directory that contains `SKILL.md` files.
 
+Local review generation does not require GitHub App credentials. If GitHub publishing context is unavailable, the reviewer prints the review and skips publishing as before.
+
 Example output:
 
 ```text
@@ -117,30 +127,64 @@ No significant issues found.
 
 ## GitHub Actions
 
-Pull requests automatically trigger `.github/workflows/review.yml` when they are:
+`Enzo.Helpers.CodeReviewer` is intended to run as a reusable GitHub Actions workflow. Consuming repositories decide when to call it.
 
-- opened
-- synchronized with new commits
-- reopened
+Recommended caller workflow:
 
-The workflow:
+```yaml
+name: Enzo Code Review
+
+on:
+  pull_request:
+    types:
+      - opened
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    uses: solakpetri/Enzo.Helpers.CodeReviewer/.github/workflows/review.yml@main
+    with:
+      ENZO_CODE_REVIEWER_APP_ID: ${{ vars.ENZO_CODE_REVIEWER_APP_ID }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ENZO_CODE_REVIEWER_PRIVATE_KEY: ${{ secrets.ENZO_CODE_REVIEWER_PRIVATE_KEY }}
+```
+
+Automatic review is recommended only for `pull_request: opened`:
+
+```text
+PR created
+    -> review automatically runs once
+
+additional commit pushed
+    -> nothing
+
+user wants another review
+    -> GitHub Actions -> Re-run jobs
+```
+
+The reusable workflow:
 
 ```text
 checks out source
 -> checks out skills
 -> generates diff
+-> creates an Enzo Code Reviewer GitHub App installation token
 -> runs reviewer
 -> prints findings
--> posts a COMMENT pull request review
+-> posts a COMMENT pull request review as the Enzo Code Reviewer GitHub App
 ```
 
-It uses GitHub-hosted `ubuntu-latest`, sets up .NET 10, checks out `Enzo.Ai.Skills` with `actions/checkout`, generates the PR diff in `$RUNNER_TEMP/changes.diff`, and runs:
+It uses GitHub-hosted `ubuntu-latest`, sets up .NET 10, checks out `Enzo.Ai.Skills` with `actions/checkout`, generates the PR diff, and runs:
 
 ```bash
-dotnet reviewer.cs "$RUNNER_TEMP/changes.diff" --skills ../Enzo.Ai.Skills
+dotnet reviewer/reviewer.cs changes.diff --skills skills
 ```
 
-The diff is generated from the pull request base SHA to the pull request head SHA, so the reviewer receives only PR changes. The generated diff file is temporary and is not committed.
+The diff is generated from the pull request base SHA to the pull request head SHA, so the reviewer receives only PR changes. The generated diff file is not committed.
 
 The reusable workflow grants only the permissions needed to read repository contents and write pull request reviews:
 
@@ -150,29 +194,53 @@ permissions:
   pull-requests: write
 ```
 
-## GitHub Secret
+Consuming repositories should grant the same permissions to the caller workflow. The Enzo Code Reviewer GitHub App installation must also have repository contents read access and pull request write access for the target repository.
 
-Configure this repository secret under GitHub Actions secrets:
+## Reusable Workflow Contract
+
+The reusable workflow accepts one non-secret input:
+
+```text
+ENZO_CODE_REVIEWER_APP_ID
+```
+
+Store the App ID as a repository or organization variable, for example `vars.ENZO_CODE_REVIEWER_APP_ID`.
+
+The reusable workflow explicitly accepts these secrets:
 
 ```text
 OPENAI_API_KEY
+ENZO_CODE_REVIEWER_PRIVATE_KEY
 ```
 
-The workflow passes it to the reviewer as:
+Do not use `secrets: inherit`. Pass only the required secrets explicitly.
+
+The GitHub App private key must be stored as a GitHub Actions secret and must never be committed. Consuming repositories provide their own `OPENAI_API_KEY`.
+
+## Authentication
+
+The workflow creates a short-lived installation token with `actions/create-github-app-token@v2` using:
+
+```text
+ENZO_CODE_REVIEWER_APP_ID
+ENZO_CODE_REVIEWER_PRIVATE_KEY
+```
+
+The private key is provided only to the token-generation step. The generated installation token is passed to the reviewer as `GITHUB_TOKEN`:
+
+```yaml
+GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+```
+
+The reviewer does not understand GitHub App authentication. It only uses `GITHUB_TOKEN` to publish the existing GitHub Pull Request Review request.
+
+The OpenAI API key is passed to the reviewer unchanged:
 
 ```yaml
 OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 ```
 
-Do not commit the key or place it in repository files.
-
-The workflow also passes the automatically provided GitHub Actions token to the reviewer:
-
-```yaml
-GITHUB_TOKEN: ${{ github.token }}
-```
-
-Consuming repositories do not need to configure a separate `GITHUB_TOKEN` secret.
+Do not commit API keys, private keys, installation tokens, `.env` files containing credentials, or credential-containing application settings. PR reviews appear under the Enzo Code Reviewer GitHub App identity.
 
 ## Current Limitations
 
@@ -180,15 +248,15 @@ The current version:
 
 - reviews PR diffs
 - loads external skills
-- runs automatically through GitHub Actions
+- runs through a reusable GitHub Actions workflow
 - prints findings to workflow logs
-- posts a GitHub Pull Request Review using `COMMENT`
+- posts a GitHub Pull Request Review using `COMMENT` as the Enzo Code Reviewer GitHub App
 - never approves PRs or requests changes
 
 Current limitations:
 
 - create inline review comments
-- a new AI review may be created every time the PR is synchronized
+- manage duplicate reviews
 
 ## Roadmap
 
