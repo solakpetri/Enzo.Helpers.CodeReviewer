@@ -4,7 +4,7 @@
 
 `Enzo.Helpers.CodeReviewer` is a lightweight AI-assisted code reviewer implemented as a .NET 10 file-based C# application.
 
-It reviews pull request diffs using external review skills and OpenAI, validates inline comment locations against the actual diff, prints a structured review report to stdout, and posts an advisory GitHub Pull Request Review report using the Enzo Code Reviewer GitHub App identity.
+It reviews pull request diffs using external review skills and OpenAI, validates inline comment locations against the actual diff, prints a structured review report to stdout, and posts an advisory GitHub Pull Request Review report using the Enzo Code Reviewer GitHub App identity. When Enzo can safely propose an exact localized fix, inline comments use GitHub's native commit-able suggestion Markdown.
 
 ## Architecture
 
@@ -25,9 +25,9 @@ Code Reviewer
         v
 OpenAI
         |
-        | returns structured findings and advice
+        | returns structured findings, remediation, and advice
         v
-GitHub Pull Request Review report plus valid inline issue comments
+GitHub Pull Request Review report plus valid inline issue comments or commit-able suggestions
 ```
 
 The GitHub review is always submitted with the `COMMENT` event. It does not approve PRs, request changes, or block merges.
@@ -44,7 +44,7 @@ Advice
 -> useful non-blocking recommendations
 ```
 
-Every successful GitHub Actions review publishes an overall Enzo Code Reviewer PR report. Valid issue locations may also receive inline comments for local context. Advice is included only in the overall report and is not posted inline.
+Every successful GitHub Actions review publishes an overall Enzo Code Reviewer PR report. Valid issue locations may also receive inline comments for local context. Some inline comments include GitHub native commit-able suggestions. Advice is included only in the overall report and is not posted inline.
 
 ## Enzo.Ai.Skills
 
@@ -134,7 +134,7 @@ Multiple EF Core operations are being started concurrently on the same DbContext
 
 Execute them sequentially or use independent DbContext instances.
 
-**Agent Prompt**
+### 🤖 Use this prompt with your coding agent
 
 > Fix the concurrent DbContext usage in src/Repositories/UserRepository.cs around line 42. Preserve existing behavior and add focused validation.
 
@@ -161,7 +161,54 @@ pie showData
 ```
 ````
 
-If there are findings, they are grouped in this order: HIGH, MEDIUM, LOW. Numbering resets inside each severity group, and severities with zero findings are omitted from the Issues Found section. Each issue includes a location, explanation, action, and directly usable coding-agent prompt.
+If there are findings, they are grouped in this order: HIGH, MEDIUM, LOW. Numbering resets inside each severity group, and severities with zero findings are omitted from the Issues Found section. Each issue includes a location, explanation, action, and one remediation path.
+
+## Remediation Modes
+
+Every issue has a coding-agent prompt available as a fallback. When the fix is safe, exact, localized, and maps to changed lines in the PR diff, Enzo may also provide a GitHub native code suggestion.
+
+Use a commit-able suggestion when Enzo can confidently provide the exact replacement for one changed line or a small contiguous changed range. Typical examples are null guards, incorrect conditions, wrong API calls, small async corrections, missing cancellation-token propagation, simple disposal fixes, straightforward validation, and small localized EF Core corrections.
+
+Inline GitHub comments with a valid suggestion look like this:
+
+````markdown
+🔴 **Possible null dereference**
+
+`request.Name` can be accessed when `request` is null.
+
+```suggestion
+if (request is null)
+{
+    throw new ArgumentNullException(nameof(request));
+}
+
+return request.Name;
+```
+
+**Suggested commit:** `fix: handle null request before accessing name`
+````
+
+GitHub exposes its native **Commit suggestion** experience for comments that contain a valid suggestion block on a pull request diff line or range. GitHub asks the person applying the suggestion to provide the commit message; Enzo cannot set that message through the review comment. Enzo therefore renders a recommended Conventional Commit message immediately below the suggestion.
+
+Use the coding-agent prompt when an exact localized replacement would be unsafe or insufficient, including architectural changes, concurrency redesign, transaction-boundary issues, multi-file fixes, complex security changes, substantial refactoring, ambiguous implementation choices, or issues requiring broader repository context.
+
+Fallback inline comments look like this:
+
+```markdown
+🟡 **Concurrent DbContext usage**
+
+The same scoped DbContext is currently used by concurrent operations.
+
+**Action**
+
+Change the implementation so operations sharing the context are not executed concurrently.
+
+### 🤖 Use this prompt with your coding agent
+
+> Fix the DbContext concurrency issue in `TransactionRepository.cs` around line 74. The same scoped DbContext is currently used by concurrent operations. Change the implementation so operations sharing the context are not executed concurrently. Preserve existing behavior and avoid unrelated refactoring. Add focused tests for the affected execution path and run the existing tests.
+```
+
+Enzo never automatically commits, pushes, merges, approves, or requests changes. Suggestions and commit messages are recommendations for the developer to inspect and apply.
 
 The Statistics section is calculated by the application, not by the model. Added lines are counted from the unified diff across files and hunks while excluding diff headers, `+++` lines, deleted lines, and metadata.
 
@@ -193,7 +240,7 @@ If there are no issues and no useful advice:
 No actionable issues or specific recommendations found. 🚀
 ```
 
-Findings are validated against `changes.diff` before creating inline comments. A finding with a valid changed new/right-side line may appear both in the report and as an inline GitHub review comment. If a model-provided location is invalid or stale, only the inline comment is omitted; the issue remains in the overall report.
+Findings are validated against `changes.diff` before creating inline comments. A finding with a valid changed new/right-side line may appear both in the report and as an inline GitHub review comment. Suggestion ranges are also validated against changed new/right-side lines before Enzo publishes a suggestion block. If a model-provided location or suggestion range is invalid or stale, only the inline suggestion/comment is omitted or downgraded to the agent-prompt fallback; the issue remains in the overall report.
 
 ## GitHub Actions
 
@@ -246,7 +293,7 @@ checks out source
 -> runs reviewer
 -> prints the Enzo Code Reviewer report
 -> posts one COMMENT pull request review report as the Enzo Code Reviewer GitHub App
--> includes valid inline issue comments in the same review where possible
+-> includes valid inline issue comments or commit-able suggestions in the same review where possible
 ```
 
 It uses GitHub-hosted `ubuntu-latest`, sets up .NET 10, checks out `Enzo.Ai.Skills` with `actions/checkout`, generates the PR diff, and runs:
@@ -323,6 +370,9 @@ The current version:
 - prints the structured Enzo Code Reviewer report to workflow logs
 - posts a GitHub Pull Request Review report using `COMMENT` as the Enzo Code Reviewer GitHub App
 - includes inline comments for issues with valid changed-line locations
+- includes GitHub native commit-able suggestions when an exact localized replacement is safe and maps to the PR diff
+- recommends Conventional Commit messages for commit-able suggestions
+- falls back to directly usable coding-agent prompts when suggestions are unsafe or unmappable
 - keeps invalid-location issues in the report while omitting only their inline comments
 - publishes advice-only and Good Job fallback reports when there are no issues
 - never approves PRs or requests changes
