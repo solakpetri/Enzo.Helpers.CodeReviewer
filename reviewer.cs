@@ -35,7 +35,10 @@ static class ReviewerApp
 
             ValidateReviewResult(review);
             var validation = ValidateFindingsAgainstDiff(review, diffInfo.ChangedLines);
-            var report = BuildReviewReport(validation.Review, diffInfo.AddedLineCount, includeSuggestionBlocks: !HasGitHubPublishingContext());
+            var hasGitHubPublishingContext = HasGitHubPublishingContext();
+            var report = hasGitHubPublishingContext
+                ? BuildReviewReport(validation.PublishedReview, diffInfo.AddedLineCount, includeSuggestionBlocks: false, includeFindingDetails: false)
+                : BuildReviewReport(validation.LocalReview, diffInfo.AddedLineCount, includeSuggestionBlocks: true, includeFindingDetails: true);
             PrintReview(report);
             await PublishGitHubReviewAsync(report, validation.InlineFindings);
             return 0;
@@ -139,7 +142,10 @@ static class ReviewerApp
         var builder = new StringBuilder();
         builder.AppendLine("You are an AI-assisted code reviewer for .NET changes.");
         builder.AppendLine();
-        builder.AppendLine("Review only the supplied PR diff. Findings must refer to changed lines from the diff and must use the new/right-side line number whenever possible.");
+        builder.AppendLine("Review only the supplied PR diff. Findings must concern changed code and must be anchored to a changed new/right-side line from the diff.");
+        builder.AppendLine("Every finding must identify the changed file path and the new/right-side line number exactly as represented by the supplied unified diff. Do not use old/left-side line numbers.");
+        builder.AppendLine("Use unchanged surrounding lines only as context for reasoning. The finding itself must attach to relevant changed code, not merely nearby unchanged code.");
+        builder.AppendLine("If you cannot identify a valid changed-code location from the supplied diff, do not report that issue as a finding. Do not manufacture locations for general observations.");
         builder.AppendLine("Return findings and advice separately. Findings are actionable issues worth fixing. Advice is useful non-blocking guidance specific to the changed code.");
         builder.AppendLine("Return only concrete, actionable problems introduced or exposed by the pull request as findings. If there are no actionable issues, return an empty findings array.");
         builder.AppendLine("Prioritize correctness bugs, security vulnerabilities, concurrency problems, race conditions, async misuse, resource leaks, EF Core misuse, database consistency issues, broken error handling, meaningful architectural violations, important missing validation, significant performance problems, and missing tests where changed behavior creates meaningful regression risk.");
@@ -156,7 +162,7 @@ static class ReviewerApp
         builder.AppendLine("External review skills may help identify problems, but these issue-only instructions are authoritative.");
         builder.AppendLine();
         builder.AppendLine("Severity must be exactly one of: high, medium, low.");
-        builder.AppendLine("File must be a path from the supplied diff. Line must be a changed new/right-side line from that file. Do not invent locations outside the diff.");
+        builder.AppendLine("File must be a path from the supplied diff. Line must be a changed new/right-side line from that file. Locations must come from the supplied unified diff. Do not invent locations outside the diff.");
         builder.AppendLine();
         builder.AppendLine("Review skills:");
 
@@ -324,7 +330,8 @@ static class ReviewerApp
 
     private static ReviewValidationResult ValidateFindingsAgainstDiff(ReviewResult review, IReadOnlyDictionary<string, HashSet<int>> diffTargets)
     {
-        var normalizedFindings = new List<ReviewFinding>();
+        var localFindings = new List<ReviewFinding>();
+        var publishedFindings = new List<ReviewFinding>();
         var inlineFindings = new List<ReviewFinding>();
         foreach (var finding in review.Findings)
         {
@@ -333,15 +340,15 @@ static class ReviewerApp
 
             if (!diffTargets.TryGetValue(file, out var validLines))
             {
-                Console.WriteLine($"Skipped inline comment for unmapped diff location: {finding.File}:{finding.Line} was not found in the PR diff.");
-                normalizedFindings.Add(RemoveCodeSuggestion(normalizedFinding));
+                Console.WriteLine($"Skipped finding '{SanitizeLogValue(finding.Title)}': {SanitizeLogValue(finding.File)}:{finding.Line} is not a valid RIGHT-side PR diff location.");
+                localFindings.Add(RemoveCodeSuggestion(normalizedFinding));
                 continue;
             }
 
             if (!validLines.Contains(finding.Line))
             {
-                Console.WriteLine($"Skipped inline comment for unmapped diff location: {finding.File}:{finding.Line} is not a changed right-side line.");
-                normalizedFindings.Add(RemoveCodeSuggestion(normalizedFinding));
+                Console.WriteLine($"Skipped finding '{SanitizeLogValue(finding.Title)}': {SanitizeLogValue(finding.File)}:{finding.Line} is not a valid RIGHT-side PR diff location.");
+                localFindings.Add(RemoveCodeSuggestion(normalizedFinding));
                 continue;
             }
 
@@ -351,7 +358,8 @@ static class ReviewerApp
                 normalizedFinding = RemoveCodeSuggestion(normalizedFinding);
             }
 
-            normalizedFindings.Add(normalizedFinding);
+            localFindings.Add(normalizedFinding);
+            publishedFindings.Add(normalizedFinding);
             inlineFindings.Add(normalizedFinding);
         }
 
@@ -360,8 +368,10 @@ static class ReviewerApp
             Console.WriteLine("No valid inline findings remained after diff validation.");
         }
 
-        return new ReviewValidationResult(new ReviewResult(normalizedFindings, review.Advice), inlineFindings);
+        return new ReviewValidationResult(new ReviewResult(localFindings, review.Advice), new ReviewResult(publishedFindings, review.Advice), inlineFindings);
     }
+
+    private static string SanitizeLogValue(string value) => value.ReplaceLineEndings(" ").Trim();
 
     private static bool IsSuggestionRangeValid(ReviewFinding finding, IReadOnlySet<int> validLines)
     {
@@ -518,6 +528,10 @@ static class ReviewerApp
         builder.AppendLine($"{GetSeverityIcon(finding.Severity)} **{finding.Title.Trim()}**");
         builder.AppendLine();
         builder.AppendLine(finding.Message.Trim());
+        builder.AppendLine();
+        builder.AppendLine("**Action**");
+        builder.AppendLine();
+        builder.AppendLine(finding.Action.Trim());
 
         if (finding.HasCodeSuggestion && !string.IsNullOrWhiteSpace(finding.SuggestedCode) && !string.IsNullOrWhiteSpace(finding.SuggestedCommit))
         {
@@ -530,10 +544,6 @@ static class ReviewerApp
             return builder.ToString().TrimEnd();
         }
 
-        builder.AppendLine();
-        builder.AppendLine("**Action**");
-        builder.AppendLine();
-        builder.AppendLine(finding.Action.Trim());
         builder.AppendLine();
         builder.AppendLine("### 🤖 Use this prompt with your coding agent");
         builder.AppendLine();
@@ -678,7 +688,7 @@ static class ReviewerApp
         return string.IsNullOrWhiteSpace(redactedBody) ? "No error details returned." : redactedBody;
     }
 
-    private static string BuildReviewReport(ReviewResult review, int addedLines, bool includeSuggestionBlocks)
+    private static string BuildReviewReport(ReviewResult review, int addedLines, bool includeSuggestionBlocks, bool includeFindingDetails)
     {
         var builder = new StringBuilder();
         builder.AppendLine("# 🤖 Enzo Code Reviewer");
@@ -700,12 +710,35 @@ static class ReviewerApp
             return builder.ToString().TrimEnd();
         }
 
+        if (includeFindingDetails)
+        {
+            AppendDetailedFindings(builder, review.Findings, includeSuggestionBlocks);
+        }
+        else
+        {
+            builder.AppendLine($"Found **{review.Findings.Count} actionable issue{(review.Findings.Count == 1 ? string.Empty : "s")}**. See the inline review comments for details.");
+            builder.AppendLine();
+        }
+
+        AppendStatistics(builder, BuildReviewStatistics(review.Findings, addedLines));
+
+        if (review.Advice.Count > 0)
+        {
+            builder.AppendLine();
+            AppendAdvice(builder, review.Advice);
+        }
+
+        return builder.ToString().TrimEnd();
+    }
+
+    private static void AppendDetailedFindings(StringBuilder builder, IReadOnlyCollection<ReviewFinding> reviewFindings, bool includeSuggestionBlocks)
+    {
         builder.AppendLine("## 🔍 Issues Found");
         builder.AppendLine();
 
         foreach (var severity in new[] { "high", "medium", "low" })
         {
-            var findings = review.Findings
+            var findings = reviewFindings
                 .Where(finding => finding.Severity == severity)
                 .ToList();
             if (findings.Count == 0)
@@ -758,16 +791,6 @@ static class ReviewerApp
             builder.AppendLine("---");
             builder.AppendLine();
         }
-
-        AppendStatistics(builder, BuildReviewStatistics(review.Findings, addedLines));
-
-        if (review.Advice.Count > 0)
-        {
-            builder.AppendLine();
-            AppendAdvice(builder, review.Advice);
-        }
-
-        return builder.ToString().TrimEnd();
     }
 
     private static ReviewStatistics BuildReviewStatistics(IReadOnlyCollection<ReviewFinding> findings, int addedLines)
@@ -786,19 +809,9 @@ static class ReviewerApp
         builder.AppendLine($"**Issues found:** {statistics.TotalIssues}  ");
         builder.AppendLine($"**Issue density:** {FormatIssueDensity(statistics)}");
         builder.AppendLine();
-        builder.AppendLine("### Severity Distribution");
-        builder.AppendLine();
-        builder.AppendLine($"- 🔴 High: {statistics.HighCount} — {FormatSeverityPercent(statistics.HighCount, statistics.TotalIssues)}");
-        builder.AppendLine($"- 🟡 Medium: {statistics.MediumCount} — {FormatSeverityPercent(statistics.MediumCount, statistics.TotalIssues)}");
-        builder.AppendLine($"- 🔵 Low: {statistics.LowCount} — {FormatSeverityPercent(statistics.LowCount, statistics.TotalIssues)}");
-        builder.AppendLine();
-        builder.AppendLine("```mermaid");
-        builder.AppendLine("pie showData");
-        builder.AppendLine("    title Issue Severity");
-        builder.AppendLine($"    \"High\" : {statistics.HighCount}");
-        builder.AppendLine($"    \"Medium\" : {statistics.MediumCount}");
-        builder.AppendLine($"    \"Low\" : {statistics.LowCount}");
-        builder.AppendLine("```");
+        builder.AppendLine($"- 🔴 High: {statistics.HighCount}");
+        builder.AppendLine($"- 🟡 Medium: {statistics.MediumCount}");
+        builder.AppendLine($"- 🔵 Low: {statistics.LowCount}");
     }
 
     private static void AppendAdvice(StringBuilder builder, IReadOnlyCollection<ReviewAdvice> advice)
@@ -824,9 +837,6 @@ static class ReviewerApp
         statistics.AddedLines == 0
             ? "N/A"
             : $"{FormatDecimal(statistics.TotalIssues / (double)statistics.AddedLines * 100)} findings per 100 added lines";
-
-    private static string FormatSeverityPercent(int count, int total) =>
-        total == 0 ? "0.0%" : $"{FormatDecimal(count / (double)total * 100)}%";
 
     private static string FormatDecimal(double value) => value.ToString("0.0", CultureInfo.InvariantCulture);
 
@@ -1087,34 +1097,41 @@ static class ReviewerApp
         ], [new ReviewAdvice("Using AsNoTracking() here would avoid unnecessary EF Core tracking because this query is read-only.")]);
 
         var valid = ValidateFindingsAgainstDiff(mixed, diffInfo.ChangedLines);
-        Assert(valid.Review.Findings.Count == 4, "invalid inline locations should remain in the overall report");
+        Assert(valid.LocalReview.Findings.Count == 4, "invalid inline locations should remain available for local output");
+        Assert(valid.PublishedReview.Findings.Count == 2, "only valid inline locations should be publishable findings");
         Assert(valid.InlineFindings.Count == 2, "only valid locations should become inline findings");
-        Assert(valid.Review.Findings[3].File == "src/Bar.cs", "finding paths should be normalized in reports");
+        Assert(valid.LocalReview.Findings[3].File == "src/Bar.cs", "finding paths should be normalized in reports");
 
         var zero = ValidateFindingsAgainstDiff(new ReviewResult([], []), diffInfo.ChangedLines);
-        Assert(zero.Review.Findings.Count == 0, "zero findings should remain zero");
+        Assert(zero.PublishedReview.Findings.Count == 0, "zero findings should remain zero");
 
         var comments = BuildGitHubReviewComments(valid.InlineFindings);
         Assert(comments.Count == 2, "valid findings should become inline comments");
         Assert(comments.All(comment => comment.Side == "RIGHT"), "inline comments should target the right side of the diff");
+        Assert(comments[0].Body.Contains("🔴 **High finding**", StringComparison.Ordinal), "HIGH finding should render inline");
+        Assert(comments[1].Body.Contains("🔵 **Low valid prefixed path**", StringComparison.Ordinal), "LOW finding should render inline");
 
-        var report = BuildReviewReport(valid.Review, diffInfo.AddedLineCount, includeSuggestionBlocks: true);
-        Assert(report.Contains("## 🔍 Issues Found", StringComparison.Ordinal), "report should include issues section when findings exist");
-        Assert(report.Contains("### 🔴 HIGH", StringComparison.Ordinal), "report should include high findings");
-        Assert(report.Contains("### 🟡 MEDIUM", StringComparison.Ordinal), "report should include medium findings");
-        Assert(report.Contains("### 🔵 LOW", StringComparison.Ordinal), "report should include low findings");
-        Assert(report.Contains("#### 1. High finding", StringComparison.Ordinal), "numbering should start at one for high severity");
-        Assert(report.Contains("#### 1. Medium invalid line", StringComparison.Ordinal), "numbering should reset for medium severity");
-        Assert(report.Contains("#### 1. Low invalid file", StringComparison.Ordinal), "numbering should reset for low severity");
-        Assert(report.Contains("**Action**", StringComparison.Ordinal), "each issue should show an action");
-        Assert(report.Contains("### 🤖 Use this prompt with your coding agent", StringComparison.Ordinal), "each issue without a suggestion should show an agent prompt");
+        var localReport = BuildReviewReport(valid.LocalReview, diffInfo.AddedLineCount, includeSuggestionBlocks: true, includeFindingDetails: true);
+        Assert(localReport.Contains("## 🔍 Issues Found", StringComparison.Ordinal), "local report should include detailed issues when findings exist");
+        Assert(localReport.Contains("#### 1. Medium invalid line", StringComparison.Ordinal), "local report should remain useful for unmappable findings");
+        Assert(localReport.Contains("### 🤖 Use this prompt with your coding agent", StringComparison.Ordinal), "local issues without a suggestion should show an agent prompt");
+
+        var report = BuildReviewReport(valid.PublishedReview, diffInfo.AddedLineCount, includeSuggestionBlocks: false, includeFindingDetails: false);
+        Assert(!report.Contains("## 🔍 Issues Found", StringComparison.Ordinal), "GitHub report should not include detailed issues section");
+        Assert(!report.Contains("High finding", StringComparison.Ordinal), "GitHub report should not repeat issue titles");
+        Assert(!report.Contains("Medium invalid line", StringComparison.Ordinal), "GitHub report should not include invalid finding titles");
+        Assert(!report.Contains("Low valid prefixed path", StringComparison.Ordinal), "GitHub report should not repeat low issue titles");
+        Assert(!report.Contains("**Action**", StringComparison.Ordinal), "GitHub report should not repeat actions");
+        Assert(!report.Contains("### 🤖 Use this prompt with your coding agent", StringComparison.Ordinal), "GitHub report should not repeat agent prompts");
+        Assert(!report.Contains("```suggestion", StringComparison.Ordinal), "GitHub report should not repeat suggestions");
+        Assert(report.Contains("Found **2 actionable issues**. See the inline review comments for details.", StringComparison.Ordinal), "GitHub report should point to inline comments");
         Assert(report.Contains("**Added lines:** 4", StringComparison.Ordinal), "statistics should show added lines");
-        Assert(report.Contains("**Issues found:** 4", StringComparison.Ordinal), "statistics should show issue count");
-        Assert(report.Contains("**Issue density:** 100.0 findings per 100 added lines", StringComparison.Ordinal), "statistics should show issue density");
-        Assert(report.Contains("🔴 High: 1 — 25.0%", StringComparison.Ordinal), "statistics should show high percentage");
-        Assert(report.Contains("🟡 Medium: 1 — 25.0%", StringComparison.Ordinal), "statistics should show medium percentage");
-        Assert(report.Contains("🔵 Low: 2 — 50.0%", StringComparison.Ordinal), "statistics should show low percentage");
-        Assert(report.Contains("```mermaid", StringComparison.Ordinal), "statistics should include Mermaid chart");
+        Assert(report.Contains("**Issues found:** 2", StringComparison.Ordinal), "statistics should count only published findings");
+        Assert(report.Contains("**Issue density:** 50.0 findings per 100 added lines", StringComparison.Ordinal), "density should count only published findings");
+        Assert(report.Contains("- 🔴 High: 1", StringComparison.Ordinal), "statistics should count published high findings");
+        Assert(report.Contains("- 🟡 Medium: 0", StringComparison.Ordinal), "statistics should count published medium findings");
+        Assert(report.Contains("- 🔵 Low: 1", StringComparison.Ordinal), "statistics should count published low findings");
+        Assert(!report.Contains("```" + "mer" + "maid", StringComparison.Ordinal), "statistics should not include a chart block");
         Assert(report.Contains("## 💡 Advice", StringComparison.Ordinal), "report should include advice when findings and advice exist");
 
         var suggestionDiff = "diff --git a/src/Baz.cs b/src/Baz.cs\nindex 7777777..8888888 100644\n--- a/src/Baz.cs\n+++ b/src/Baz.cs\n@@ -1,3 +1,5 @@ public class Baz\n context\n+var name = request.Name;\n+return name;\n context two";
@@ -1128,9 +1145,11 @@ static class ReviewerApp
 
         var suggestionComments = BuildGitHubReviewComments(suggestions.InlineFindings);
         Assert(suggestionComments[0].Body.Contains("```suggestion", StringComparison.Ordinal), "single-line suggestion should use GitHub suggestion Markdown");
+        Assert(suggestionComments[0].Body.Contains("**Action**", StringComparison.Ordinal), "inline suggestion comments should include action guidance");
         Assert(suggestionComments[0].Body.Contains("**Suggested commit:** `fix: handle null request before accessing name`", StringComparison.Ordinal), "fix commit recommendation should be rendered");
         Assert(!suggestionComments[0].Body.Contains("Use this prompt", StringComparison.Ordinal), "inline suggestion comments should not include redundant agent prompts");
         Assert(suggestionComments[1].StartLine == 2 && suggestionComments[1].Line == 3, "multi-line suggestions should publish a GitHub review range");
+        Assert(suggestionComments[1].Body.Contains("🟡 **Use framework result abstraction**", StringComparison.Ordinal), "MEDIUM finding should render inline");
         Assert(suggestionComments[1].Body.Contains("**Suggested commit:** `refactor: use framework result abstraction`", StringComparison.Ordinal), "refactor commit recommendation should be rendered");
 
         var githubRequestJson = CreateGitHubReviewRequestJson("Report", suggestionComments);
@@ -1138,11 +1157,15 @@ static class ReviewerApp
         Assert(githubRequestJson.Contains("\"start_line\":2", StringComparison.Ordinal), "GitHub multi-line suggestion comments should include start_line");
         Assert(githubRequestJson.Contains("suggestion", StringComparison.Ordinal), "GitHub request should include suggestion Markdown");
 
-        var suggestionReport = BuildReviewReport(suggestions.Review, suggestionDiffInfo.AddedLineCount, includeSuggestionBlocks: true);
+        var suggestionReport = BuildReviewReport(suggestions.LocalReview, suggestionDiffInfo.AddedLineCount, includeSuggestionBlocks: true, includeFindingDetails: true);
         Assert(suggestionReport.Contains("**Commit-able suggestion**", StringComparison.Ordinal), "report should identify commit-able suggestions");
         Assert(suggestionReport.Contains("```suggestion", StringComparison.Ordinal), "local report should expose suggested code when inline publishing is unavailable");
         Assert(suggestionReport.Contains("fix: handle null request before accessing name", StringComparison.Ordinal), "report should include fix commit recommendation");
         Assert(suggestionReport.Contains("refactor: use framework result abstraction", StringComparison.Ordinal), "report should include refactor commit recommendation");
+        var compactSuggestionReport = BuildReviewReport(suggestions.PublishedReview, suggestionDiffInfo.AddedLineCount, includeSuggestionBlocks: false, includeFindingDetails: false);
+        Assert(!compactSuggestionReport.Contains("**Commit-able suggestion**", StringComparison.Ordinal), "GitHub report should not repeat suggestion details");
+        Assert(!compactSuggestionReport.Contains("fix: handle null request before accessing name", StringComparison.Ordinal), "GitHub report should not repeat Conventional Commit recommendations");
+        Assert(!compactSuggestionReport.Contains("```suggestion", StringComparison.Ordinal), "GitHub report should not repeat suggestion Markdown");
 
         var fallbackComment = BuildInlineCommentBody(new ReviewFinding("src/Baz.cs", 2, "medium", "Complex concurrency issue", "The same scoped DbContext is used by concurrent operations.", "Change the implementation so operations sharing the context are not executed concurrently.", "Fix the DbContext concurrency issue in src/Baz.cs around line 2. Preserve existing behavior, avoid unrelated refactoring, add focused tests for the affected execution path, and run the existing tests."));
         Assert(!fallbackComment.Contains("```suggestion", StringComparison.Ordinal), "issue without suggestion should not render suggestion Markdown");
@@ -1151,35 +1174,38 @@ static class ReviewerApp
         var invalidSuggestion = ValidateFindingsAgainstDiff(new ReviewResult([
             new ReviewFinding("src/Baz.cs", 2, "high", "Invalid suggestion range", "The issue is valid but the suggestion range includes unchanged code.", "Fix the issue without applying the unsafe suggested range.", "Fix the issue in src/Baz.cs around line 2. Preserve unrelated behavior, avoid unrelated refactoring, and add focused validation.", HasCodeSuggestion: true, SuggestedCode: "return name;", SuggestionStartLine: 1, SuggestionEndLine: 2, SuggestedCommit: "fix: correct invalid range")
         ], []), suggestionDiffInfo.ChangedLines);
-        Assert(invalidSuggestion.Review.Findings.Count == 1 && !invalidSuggestion.Review.Findings[0].HasCodeSuggestion, "invalid suggestion range should stay in the report and fall back to agent prompt");
+        Assert(invalidSuggestion.PublishedReview.Findings.Count == 1 && !invalidSuggestion.PublishedReview.Findings[0].HasCodeSuggestion, "invalid suggestion range should publish as an inline agent prompt fallback");
         Assert(invalidSuggestion.InlineFindings.Count == 1, "valid issue location should still receive an inline fallback comment");
         Assert(BuildInlineCommentBody(invalidSuggestion.InlineFindings[0]).Contains("Use this prompt", StringComparison.Ordinal), "invalid suggestion range should publish agent prompt fallback");
 
         var unmappableSuggestion = ValidateFindingsAgainstDiff(new ReviewResult([
             new ReviewFinding("missing/File.cs", 2, "low", "Unmappable suggestion", "The issue is valid but the location is not in the PR diff.", "Fix the issue after locating the changed code.", "Fix the issue in missing/File.cs around line 2 after locating the affected changed code. Preserve unrelated behavior, avoid unrelated refactoring, and add focused validation.", HasCodeSuggestion: true, SuggestedCode: "return value;", SuggestionStartLine: 2, SuggestionEndLine: 2, SuggestedCommit: "fix: handle unmappable issue")
         ], []), suggestionDiffInfo.ChangedLines);
-        Assert(unmappableSuggestion.Review.Findings.Count == 1 && !unmappableSuggestion.Review.Findings[0].HasCodeSuggestion, "unmappable suggestions should stay in the report and fall back to agent prompt");
+        Assert(unmappableSuggestion.LocalReview.Findings.Count == 1 && !unmappableSuggestion.LocalReview.Findings[0].HasCodeSuggestion, "unmappable suggestions should stay available in local output and fall back to agent prompt");
+        Assert(unmappableSuggestion.PublishedReview.Findings.Count == 0, "unmappable issues should be skipped from publication");
         Assert(unmappableSuggestion.InlineFindings.Count == 0, "unmappable issue location should not publish inline comments");
-        Assert(BuildReviewReport(unmappableSuggestion.Review, suggestionDiffInfo.AddedLineCount, includeSuggestionBlocks: true).Contains("Use this prompt", StringComparison.Ordinal), "unmappable suggestion should show agent prompt in the report");
+        Assert(BuildReviewReport(unmappableSuggestion.LocalReview, suggestionDiffInfo.AddedLineCount, includeSuggestionBlocks: true, includeFindingDetails: true).Contains("Use this prompt", StringComparison.Ordinal), "unmappable suggestion should show agent prompt in local output");
+        var unmappableGitHubReport = BuildReviewReport(unmappableSuggestion.PublishedReview, suggestionDiffInfo.AddedLineCount, includeSuggestionBlocks: false, includeFindingDetails: false);
+        Assert(!unmappableGitHubReport.Contains("Unmappable suggestion", StringComparison.Ordinal), "unmappable finding should not appear in GitHub report");
 
         var noMedium = BuildReviewReport(new ReviewResult([
             new ReviewFinding("src/Foo.cs", 11, "high", "Only high", "Message", "Action", "Prompt"),
             new ReviewFinding("src/Bar.cs", 2, "low", "Only low", "Message", "Action", "Prompt")
-        ], []), diffInfo.AddedLineCount, includeSuggestionBlocks: true);
+        ], []), diffInfo.AddedLineCount, includeSuggestionBlocks: true, includeFindingDetails: true);
         Assert(!noMedium.Contains("### 🟡 MEDIUM", StringComparison.Ordinal), "severity sections with zero findings should be omitted");
 
         var zeroAddedReport = BuildReviewReport(new ReviewResult([
             new ReviewFinding("src/Foo.cs", 11, "high", "Zero added", "Message", "Action", "Prompt")
-        ], []), 0, includeSuggestionBlocks: true);
+        ], []), 0, includeSuggestionBlocks: false, includeFindingDetails: false);
         Assert(zeroAddedReport.Contains("**Issue density:** N/A", StringComparison.Ordinal), "zero added lines should avoid density division");
 
-        var adviceOnlyReport = BuildReviewReport(new ReviewResult([], [new ReviewAdvice("Use the built-in framework API here to reduce custom code.")]), diffInfo.AddedLineCount, includeSuggestionBlocks: true);
+        var adviceOnlyReport = BuildReviewReport(new ReviewResult([], [new ReviewAdvice("Use the built-in framework API here to reduce custom code.")]), diffInfo.AddedLineCount, includeSuggestionBlocks: false, includeFindingDetails: false);
         Assert(!adviceOnlyReport.Contains("## 🔍 Issues Found", StringComparison.Ordinal), "advice-only report should omit issues");
         Assert(!adviceOnlyReport.Contains("## 📊 Statistics", StringComparison.Ordinal), "advice-only report should omit statistics");
         Assert(adviceOnlyReport.Contains("## 💡 Advice", StringComparison.Ordinal), "advice-only report should include advice");
         Assert(!adviceOnlyReport.Contains("```suggestion", StringComparison.Ordinal) && !adviceOnlyReport.Contains("Use this prompt", StringComparison.Ordinal), "advice should not receive suggestions or agent prompts");
 
-        var goodJobReport = BuildReviewReport(new ReviewResult([], []), diffInfo.AddedLineCount, includeSuggestionBlocks: true);
+        var goodJobReport = BuildReviewReport(new ReviewResult([], []), diffInfo.AddedLineCount, includeSuggestionBlocks: false, includeFindingDetails: false);
         Assert(goodJobReport.Contains("## ✨ Good job!", StringComparison.Ordinal), "empty review should include good job fallback");
         Assert(!goodJobReport.Contains("## 📊 Statistics", StringComparison.Ordinal), "empty review should omit statistics");
 
@@ -1210,7 +1236,7 @@ record ReviewSkill(string Name, string Content);
 
 record DiffInfo(Dictionary<string, HashSet<int>> ChangedLines, int AddedLineCount);
 
-record ReviewValidationResult(ReviewResult Review, List<ReviewFinding> InlineFindings);
+record ReviewValidationResult(ReviewResult LocalReview, ReviewResult PublishedReview, List<ReviewFinding> InlineFindings);
 
 record ReviewResult(List<ReviewFinding> Findings, List<ReviewAdvice> Advice);
 
