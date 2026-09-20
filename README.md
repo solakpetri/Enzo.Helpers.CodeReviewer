@@ -4,7 +4,7 @@
 
 `Enzo.Helpers.CodeReviewer` is a lightweight AI-assisted code reviewer implemented as a .NET 10 file-based C# application.
 
-It reviews pull request diffs using external review skills and OpenAI, validates inline comment locations against the actual diff, prints a structured review report to stdout, and posts an advisory GitHub Pull Request Review report using the Enzo Code Reviewer GitHub App identity. When Enzo can safely propose an exact localized fix, inline comments use GitHub's native commit-able suggestion Markdown.
+It reviews pull request diffs using external review skills and OpenAI, validates inline comment locations against the actual diff, prints a structured review report to stdout, and posts an advisory GitHub Pull Request Review using the Enzo Code Reviewer GitHub App identity. In GitHub, actionable findings are published directly as inline review comments on changed code. When Enzo can safely propose an exact localized fix, inline comments use GitHub's native commit-able suggestion Markdown.
 
 ## Architecture
 
@@ -27,7 +27,7 @@ OpenAI
         |
         | returns structured findings, remediation, and advice
         v
-GitHub Pull Request Review report plus valid inline issue comments or commit-able suggestions
+GitHub Pull Request Review summary plus valid inline issue comments or commit-able suggestions
 ```
 
 The GitHub review is always submitted with the `COMMENT` event. It does not approve PRs, request changes, or block merges.
@@ -44,7 +44,7 @@ Advice
 -> useful non-blocking recommendations
 ```
 
-Every successful GitHub Actions review publishes an overall Enzo Code Reviewer PR report. Valid issue locations may also receive inline comments for local context. Some inline comments include GitHub native commit-able suggestions. Advice is included only in the overall report and is not posted inline.
+Every successful GitHub Actions review publishes one Enzo Code Reviewer PR review. The overall body stays compact and contains review-level information such as statistics and Advice. Detailed findings are not duplicated in the overall body; each valid finding appears inline against the changed code. Some inline comments include GitHub native commit-able suggestions. Advice is included only in the overall report and is not posted inline.
 
 ## Enzo.Ai.Skills
 
@@ -113,55 +113,29 @@ dotnet reviewer.cs changes.diff --skills ../Enzo.Ai.Skills
 
 `--skills` points to the external skills directory that contains `SKILL.md` files.
 
-Local review generation does not require GitHub App credentials. If GitHub publishing context is unavailable, the reviewer prints the same logical report and skips GitHub publishing.
+Local review generation does not require GitHub App credentials. If GitHub publishing context is unavailable, the reviewer prints detailed findings to stdout and skips GitHub publishing. This keeps local execution useful even though GitHub PR presentation is inline-only.
 
-Example output:
+Example GitHub review body:
 
-````markdown
+```markdown
 # 🤖 Enzo Code Reviewer
 
-## 🔍 Issues Found
-
-### 🔴 HIGH
-
-#### 1. Concurrent DbContext usage
-
-**Location:** `src/Repositories/UserRepository.cs:42`
-
-Multiple EF Core operations are being started concurrently on the same DbContext.
-
-**Action**
-
-Execute them sequentially or use independent DbContext instances.
-
-### 🤖 Use this prompt with your coding agent
-
-> Fix the concurrent DbContext usage in src/Repositories/UserRepository.cs around line 42. Preserve existing behavior and add focused validation.
-
----
+Found **1 actionable issue**. See the inline review comments for details.
 
 ## 📊 Statistics
 
-**Added lines:** 80
-**Issues found:** 1
+**Added lines:** 80  
+**Issues found:** 1  
 **Issue density:** 1.3 findings per 100 added lines
 
-### Severity Distribution
-
-- 🔴 High: 1 — 100.0%
-- 🟡 Medium: 0 — 0.0%
-- 🔵 Low: 0 — 0.0%
-
-```mermaid
-pie showData
-    title Issue Severity
-    "High" : 1
-    "Medium" : 0
-    "Low" : 0
+- 🔴 High: 1
+- 🟡 Medium: 0
+- 🔵 Low: 0
 ```
-````
 
-If there are findings, they are grouped in this order: HIGH, MEDIUM, LOW. Numbering resets inside each severity group, and severities with zero findings are omitted from the Issues Found section. Each issue includes a location, explanation, action, and one remediation path.
+Detailed issue descriptions, locations, actions, code suggestions, Conventional Commit recommendations, and coding-agent prompts are intentionally absent from the overall GitHub review body. They appear only in inline comments attached to the relevant changed code.
+
+Severity is represented as 🔴 HIGH, 🟡 MEDIUM, and 🔵 LOW. The former Mermaid severity pie chart has been removed and no replacement chart is generated.
 
 ## Remediation Modes
 
@@ -175,6 +149,10 @@ Inline GitHub comments with a valid suggestion look like this:
 🔴 **Possible null dereference**
 
 `request.Name` can be accessed when `request` is null.
+
+**Action**
+
+Handle the null case before accessing `Name`.
 
 ```suggestion
 if (request is null)
@@ -210,7 +188,7 @@ Change the implementation so operations sharing the context are not executed con
 
 Enzo never automatically commits, pushes, merges, approves, or requests changes. Suggestions and commit messages are recommendations for the developer to inspect and apply.
 
-The Statistics section is calculated by the application, not by the model. Added lines are counted from the unified diff across files and hunks while excluding diff headers, `+++` lines, deleted lines, and metadata.
+The Statistics section is calculated by the application, not by the model. Added lines are counted from the unified diff across files and hunks while excluding diff headers, `+++` lines, deleted lines, and metadata. Issue totals, severity counts, and density are based on successfully published inline findings after location validation.
 
 Issue density means:
 
@@ -240,7 +218,9 @@ If there are no issues and no useful advice:
 No actionable issues or specific recommendations found. 🚀
 ```
 
-Findings are validated against `changes.diff` before creating inline comments. A finding with a valid changed new/right-side line may appear both in the report and as an inline GitHub review comment. Suggestion ranges are also validated against changed new/right-side lines before Enzo publishes a suggestion block. If a model-provided location or suggestion range is invalid or stale, only the inline suggestion/comment is omitted or downgraded to the agent-prompt fallback; the issue remains in the overall report.
+Findings are validated against `changes.diff` before creating inline comments. A finding must map to a changed new/right-side line in the PR diff. Suggestion ranges are also validated against contiguous changed new/right-side lines before Enzo publishes a suggestion block.
+
+If a model-provided finding location is invalid or stale, Enzo skips that finding for GitHub publication and logs a concise warning instead of guessing a nearby line or moving the issue into the overall body. If the finding location is valid but the code suggestion range is not safe, Enzo keeps the inline comment and falls back to the coding-agent prompt.
 
 ## GitHub Actions
 
@@ -292,8 +272,9 @@ checks out source
 -> creates an Enzo Code Reviewer GitHub App installation token
 -> runs reviewer
 -> prints the Enzo Code Reviewer report
--> posts one COMMENT pull request review report as the Enzo Code Reviewer GitHub App
--> includes valid inline issue comments or commit-able suggestions in the same review where possible
+-> posts one COMMENT pull request review as the Enzo Code Reviewer GitHub App
+-> includes compact overall statistics and Advice in the review body
+-> includes every valid finding as an inline issue comment or commit-able suggestion in the same review
 ```
 
 It uses GitHub-hosted `ubuntu-latest`, sets up .NET 10, checks out `Enzo.Ai.Skills` with `actions/checkout`, generates the PR diff, and runs:
@@ -302,7 +283,7 @@ It uses GitHub-hosted `ubuntu-latest`, sets up .NET 10, checks out `Enzo.Ai.Skil
 dotnet reviewer/reviewer.cs changes.diff --skills skills
 ```
 
-The diff is generated from the pull request base SHA to the pull request head SHA, so the reviewer receives only PR changes. The generated diff file is not committed. The reviewer parses this unified diff to count added lines for statistics and determine valid new/right-side inline comment targets.
+The diff is generated from the pull request base SHA to the pull request head SHA, so the reviewer receives only PR changes. The generated diff file is not committed. The reviewer parses this unified diff to count added lines for statistics and determine valid new/right-side inline comment targets. Findings that cannot be safely mapped to those targets are skipped for GitHub publication, and statistics represent only the findings that were published inline.
 
 The reusable workflow grants only the permissions needed to read repository contents and write pull request reviews:
 
@@ -368,12 +349,12 @@ The current version:
 - loads external skills
 - runs through a reusable GitHub Actions workflow
 - prints the structured Enzo Code Reviewer report to workflow logs
-- posts a GitHub Pull Request Review report using `COMMENT` as the Enzo Code Reviewer GitHub App
-- includes inline comments for issues with valid changed-line locations
+- posts a GitHub Pull Request Review using `COMMENT` as the Enzo Code Reviewer GitHub App
+- keeps detailed GitHub findings inline-only against valid changed-line locations
 - includes GitHub native commit-able suggestions when an exact localized replacement is safe and maps to the PR diff
-- recommends Conventional Commit messages for commit-able suggestions
-- falls back to directly usable coding-agent prompts when suggestions are unsafe or unmappable
-- keeps invalid-location issues in the report while omitting only their inline comments
+- recommends Conventional Commit messages with applicable inline suggestions
+- falls back to directly usable coding-agent prompts inline when suggestions are unsafe
+- skips unmappable findings instead of attaching them to unrelated code or repeating them in the review body
 - publishes advice-only and Good Job fallback reports when there are no issues
 - never approves PRs or requests changes
 
